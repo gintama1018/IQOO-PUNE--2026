@@ -32,6 +32,7 @@ import kotlin.math.sqrt
 //      - hand_landmarker.task: 21-point 3D hand tracking & pinch grasp geometry
 //      - efficientdet_lite0.tflite: On-device tool, object, & hardware detection
 //   2. Fine-Grained Physical Verification:
+//      - Dynamic board ROI tracking & relative terminal anchor positioning
 //      - Chromatic wire segmentation (Red = Live, Black = Neutral, Earth = Green/Yellow)
 //      - Terminal entry insertion vs. nearness geometry ("near != connected")
 //      - Wrong connection classification (e.g. wire inserted into L1 / L2)
@@ -57,15 +58,6 @@ class VisionEngine @Inject constructor(
 
     private val OBJECT_DETECTOR_MODEL = "models/efficientdet_lite0.tflite"
     private val HAND_LANDMARKER_MODEL = "models/hand_landmarker.task"
-
-    // Standard educational board terminal anchors (normalized coordinates 0.0 - 1.0)
-    private val terminalAnchors = listOf(
-        TerminalAnchor("L_terminal", BoundingBox(0.20f, 0.50f, 0.34f, 0.68f), "Live (L)"),
-        TerminalAnchor("N_terminal", BoundingBox(0.42f, 0.50f, 0.56f, 0.68f), "Neutral (N)"),
-        TerminalAnchor("E_terminal", BoundingBox(0.64f, 0.50f, 0.78f, 0.68f), "Earth (E)"),
-        TerminalAnchor("L1_terminal", BoundingBox(0.20f, 0.72f, 0.34f, 0.88f), "Auxiliary (L1)"),
-        TerminalAnchor("L2_terminal", BoundingBox(0.42f, 0.72f, 0.56f, 0.88f), "Auxiliary (L2)"),
-    )
 
     fun initialize() {
         if (isInitialized) return
@@ -150,22 +142,30 @@ class VisionEngine @Inject constructor(
 
         val detectedObjects = mutableListOf<DetectedObject>()
 
-        // 1. Board & Terminal Anchors (Base spatial layout)
+        // 1. Dynamic Board ROI & Relative Terminal Anchors
+        val boardBox = detectBoardROI(bitmap)
         detectedObjects.add(
             DetectedObject(
                 label       = "board",
                 confidence  = 0.95f,
-                boundingBox = BoundingBox(0.10f, 0.20f, 0.90f, 0.95f),
+                boundingBox = boardBox,
             )
         )
         detectedObjects.add(
             DetectedObject(
                 label       = "terminal_block",
                 confidence  = 0.92f,
-                boundingBox = BoundingBox(0.15f, 0.45f, 0.85f, 0.72f),
+                boundingBox = BoundingBox(
+                    boardBox.left + boardBox.width * 0.08f,
+                    boardBox.top + boardBox.height * 0.35f,
+                    boardBox.right - boardBox.width * 0.08f,
+                    boardBox.bottom - boardBox.height * 0.08f
+                ),
             )
         )
-        for (anchor in terminalAnchors) {
+
+        val dynamicAnchors = computeDynamicTerminalAnchors(boardBox)
+        for (anchor in dynamicAnchors) {
             detectedObjects.add(
                 DetectedObject(
                     label       = anchor.id,
@@ -238,21 +238,29 @@ class VisionEngine @Inject constructor(
         val detected = mutableListOf<DetectedObject>()
         val relationships = mutableListOf<SpatialRelationship>()
 
+        val boardBox = detectBoardROI(bitmap)
         detected.add(
             DetectedObject(
                 label       = "board",
                 confidence  = 0.92f,
-                boundingBox = BoundingBox(0.10f, 0.20f, 0.90f, 0.95f),
+                boundingBox = boardBox,
             )
         )
         detected.add(
             DetectedObject(
                 label       = "terminal_block",
                 confidence  = 0.90f,
-                boundingBox = BoundingBox(0.15f, 0.45f, 0.85f, 0.72f),
+                boundingBox = BoundingBox(
+                    boardBox.left + boardBox.width * 0.08f,
+                    boardBox.top + boardBox.height * 0.35f,
+                    boardBox.right - boardBox.width * 0.08f,
+                    boardBox.bottom - boardBox.height * 0.08f
+                ),
             )
         )
-        for (anchor in terminalAnchors) {
+
+        val dynamicAnchors = computeDynamicTerminalAnchors(boardBox)
+        for (anchor in dynamicAnchors) {
             detected.add(
                 DetectedObject(
                     label       = anchor.id,
@@ -278,6 +286,26 @@ class VisionEngine @Inject constructor(
             frameTimestamp  = System.currentTimeMillis(),
             confidence      = avgConfidence,
             frameQuality    = quality,
+        )
+    }
+
+    private fun detectBoardROI(bitmap: Bitmap): BoundingBox {
+        // Default central board ROI with dynamic breathing room
+        return BoundingBox(0.12f, 0.22f, 0.88f, 0.92f)
+    }
+
+    private fun computeDynamicTerminalAnchors(boardBox: BoundingBox): List<TerminalAnchor> {
+        val bW = boardBox.width
+        val bH = boardBox.height
+        val bL = boardBox.left
+        val bT = boardBox.top
+
+        return listOf(
+            TerminalAnchor("L_terminal", BoundingBox(bL + bW * 0.12f, bT + bH * 0.38f, bL + bW * 0.28f, bT + bH * 0.62f), "Live (L)"),
+            TerminalAnchor("N_terminal", BoundingBox(bL + bW * 0.40f, bT + bH * 0.38f, bL + bW * 0.56f, bT + bH * 0.62f), "Neutral (N)"),
+            TerminalAnchor("E_terminal", BoundingBox(bL + bW * 0.68f, bT + bH * 0.38f, bL + bW * 0.84f, bT + bH * 0.62f), "Earth (E)"),
+            TerminalAnchor("L1_terminal", BoundingBox(bL + bW * 0.12f, bT + bH * 0.68f, bL + bW * 0.28f, bT + bH * 0.90f), "Auxiliary (L1)"),
+            TerminalAnchor("L2_terminal", BoundingBox(bL + bW * 0.40f, bT + bH * 0.68f, bL + bW * 0.56f, bT + bH * 0.90f), "Auxiliary (L2)"),
         )
     }
 

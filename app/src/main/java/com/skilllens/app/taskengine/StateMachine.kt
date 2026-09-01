@@ -9,7 +9,8 @@ import javax.inject.Inject
 // ─────────────────────────────────────────────────────────────────────────────
 // Deterministic Task State Machine
 //
-// Thread-safe finite state machine executing deterministic validation rules.
+// Thread-safe finite state machine executing deterministic validation rules,
+// debounce verification, and proactive step timeouts.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class StateMachine @Inject constructor(
@@ -23,6 +24,8 @@ class StateMachine @Inject constructor(
     private var debounceCount: Int      = 0
     private var pendingState: TaskState = TaskState.IDLE
     private var lastTransitionTime: Long = 0L
+    private var stepStartTime: Long     = 0L
+    private var timeoutNudgeEmitted: Boolean = false
 
     private val _taskState = MutableStateFlow(TaskState.IDLE)
     val taskState: StateFlow<TaskState> = _taskState.asStateFlow()
@@ -32,10 +35,13 @@ class StateMachine @Inject constructor(
 
     fun loadSkill(skillDefinition: SkillDefinition) {
         synchronized(stateLock) {
+            val now = System.currentTimeMillis()
             skill                   = skillDefinition
             currentStepIndex        = 0
             debounceCount           = 0
             pendingState            = TaskState.IDLE
+            stepStartTime           = now
+            timeoutNudgeEmitted     = false
             _taskState.value        = TaskState.STEP_1_IDENTIFY
             _validationResult.value = null
             Timber.d("StateMachine: Skill loaded — ${skillDefinition.name}")
@@ -44,9 +50,12 @@ class StateMachine @Inject constructor(
 
     fun reset() {
         synchronized(stateLock) {
+            val now = System.currentTimeMillis()
             currentStepIndex        = 0
             debounceCount           = 0
             pendingState            = TaskState.IDLE
+            stepStartTime           = now
+            timeoutNudgeEmitted     = false
             _taskState.value        = TaskState.STEP_1_IDENTIFY
             _validationResult.value = null
             Timber.d("StateMachine: Reset")
@@ -61,6 +70,7 @@ class StateMachine @Inject constructor(
         synchronized(stateLock) {
             val currentState = _taskState.value
             val skill        = skill ?: return
+            val now          = System.currentTimeMillis()
 
             // 1. Check frame quality
             val qualityState = resolveQualityState(observation.frameQuality)
@@ -80,7 +90,27 @@ class StateMachine @Inject constructor(
             }
             val step = steps[currentStepIndex]
 
-            // 4. Low confidence guard
+            // 4. Step Timeout & Inactivity Nudge
+            if (step.timeoutMs > 0 && (now - stepStartTime) > step.timeoutMs && !timeoutNudgeEmitted) {
+                timeoutNudgeEmitted = true
+                _validationResult.value = ValidationResult(
+                    previousState = currentState,
+                    newState      = currentState,
+                    stateChanged  = false,
+                    feedback = FeedbackEvent(
+                        type    = FeedbackType.INFO,
+                        title   = "💡 Hint: ${step.title}",
+                        message = step.instruction,
+                        hapticPattern = HapticPattern.TICK,
+                    ),
+                    stepIndex  = currentStepIndex,
+                    totalSteps = steps.size,
+                    confidence = observation.confidence,
+                )
+                Timber.d("StateMachine: Step ${step.id} timeout nudge emitted")
+            }
+
+            // 5. Low confidence guard
             if (observation.confidence < step.minConfidence) {
                 if (_taskState.value != TaskState.LOW_CONFIDENCE) {
                     _taskState.value = TaskState.LOW_CONFIDENCE
@@ -102,10 +132,10 @@ class StateMachine @Inject constructor(
                 return
             }
 
-            // 5. Validate observation against current step
+            // 6. Validate observation against current step
             val result = validator.validate(step, observation, currentState)
 
-            // 6. Debounce: require N consecutive frames before committing
+            // 7. Debounce: require N consecutive frames before committing
             if (result.proposedState == pendingState) {
                 debounceCount++
             } else {
@@ -117,9 +147,8 @@ class StateMachine @Inject constructor(
                 return
             }
 
-            // 7. Commit state transition
+            // 8. Commit state transition
             debounceCount = 0
-            val now = System.currentTimeMillis()
 
             val isErrorState = result.proposedState in listOf(
                 TaskState.WRONG_CONNECTION,
@@ -141,6 +170,9 @@ class StateMachine @Inject constructor(
                 )
             } else if (result.proposedState != currentState && result.proposedState != TaskState.LOW_CONFIDENCE) {
                 val nextStepIndex = currentStepIndex + 1
+                stepStartTime = now
+                timeoutNudgeEmitted = false
+
                 if (nextStepIndex >= steps.size) {
                     currentStepIndex = nextStepIndex
                     transitionTo(TaskState.COMPLETED, observation.confidence, skill)

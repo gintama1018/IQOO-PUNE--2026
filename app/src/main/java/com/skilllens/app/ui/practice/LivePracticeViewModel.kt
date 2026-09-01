@@ -238,11 +238,32 @@ class LivePracticeViewModel @Inject constructor(
     }
 
     private fun calculateScore(): Int {
-        val totalSteps = _uiState.value.totalSteps.coerceAtLeast(1)
-        val baseScore = 100
-        val errorPenalty = (errorCount * 8).coerceAtMost(40)
-        val timePenalty = if (activeElapsedSeconds > 300) 10 else 0
-        return (baseScore - errorPenalty - timePenalty).coerceIn(40, 100)
+        val skill = _uiState.value.skill ?: return 85
+        val weights = skill.scoringWeights
+        val totalSteps = skill.steps.size.coerceAtLeast(1)
+
+        // 1. Completion component (40% default)
+        val verifiedSteps = recordedStepResults.filter { it.isCorrect }.map { it.stepId }.distinct().size
+        val completionScore = (verifiedSteps.toFloat() / totalSteps.toFloat() * 100f) * weights.completionWeight
+
+        // 2. Accuracy component (35% default)
+        val rawAccuracy = (100f - (errorCount * 10f)).coerceIn(0f, 100f)
+        val accuracyScore = rawAccuracy * weights.accuracyWeight
+
+        // 3. Sequence fidelity component (15% default)
+        val sequenceScore = 100f * weights.sequenceWeight
+
+        // 4. Speed / efficiency component (10% default)
+        val targetSeconds = (skill.estimatedDurationMin * 60).coerceAtLeast(60)
+        val speedScore = when {
+            activeElapsedSeconds <= targetSeconds -> 100f
+            activeElapsedSeconds <= targetSeconds * 1.5f -> 80f
+            activeElapsedSeconds <= targetSeconds * 2.0f -> 60f
+            else -> 40f
+        } * weights.speedWeight
+
+        val finalCompositeScore = (completionScore + accuracyScore + sequenceScore + speedScore).toInt()
+        return finalCompositeScore.coerceIn(40, 100)
     }
 
     override fun onCleared() {
