@@ -9,6 +9,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.TrendingUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -201,7 +203,7 @@ fun ResultScreen(
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.TrendingUp, null, tint = ColorWarning, modifier = Modifier.size(18.dp))
+                    Icon(Icons.AutoMirrored.Outlined.TrendingUp, null, tint = ColorWarning, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("Focus: Terminal Verification Precision", style = MaterialTheme.typography.bodySmall, color = ColorWarning)
                 }
@@ -273,7 +275,7 @@ fun SessionDetailScreen(sessionId: String, onBack: () -> Unit) {
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Back", tint = ColorOnBackground) }
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = ColorOnBackground) }
             Text("Session Details", style = MaterialTheme.typography.titleLarge, color = ColorOnBackground, fontWeight = FontWeight.Bold)
         }
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

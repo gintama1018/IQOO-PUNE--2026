@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -22,7 +23,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -31,7 +31,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -39,17 +38,19 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.skilllens.app.taskengine.DetectedObject
 import com.skilllens.app.taskengine.FeedbackType
 import com.skilllens.app.taskengine.TaskState
 import com.skilllens.app.ui.theme.*
+import com.skilllens.app.vision.VisionMode
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LivePracticeScreen — The core product screen
 //
 // Layout (top to bottom):
-//   1. Status bar (skill name, timer, state)
+//   1. Status bar (skill name, timer, state, vision mode badge)
 //   2. Camera preview with HUD overlay
 //   3. Progress bar
 //   4. Feedback card
@@ -66,9 +67,7 @@ fun LivePracticeScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val ext = SkillLensThemeTokens.colors
 
-    // Camera permission
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -86,10 +85,9 @@ fun LivePracticeScreen(
         viewModel.loadSkill(skillId)
     }
 
-    // Completion handler
     LaunchedEffect(uiState.isCompleted) {
         if (uiState.isCompleted) {
-            kotlinx.coroutines.delay(2000)
+            kotlinx.coroutines.delay(1800)
             onSessionComplete(skillId)
         }
     }
@@ -114,8 +112,8 @@ fun LivePracticeScreen(
                 PracticeTopBar(
                     skillName       = uiState.skill?.name ?: "",
                     state           = uiState.currentState,
+                    visionMode      = uiState.visionMode,
                     durationSec     = uiState.sessionDurationSec,
-                    confidence      = uiState.confidence,
                     onPause         = { viewModel.pause() },
                     onBack          = onBack,
                 )
@@ -133,7 +131,6 @@ fun LivePracticeScreen(
                         currentState    = uiState.currentState,
                     )
 
-                    // Corner brackets overlay
                     HudCornerBrackets(modifier = Modifier.fillMaxSize())
                 }
 
@@ -147,7 +144,6 @@ fun LivePracticeScreen(
                 // ── 4. Feedback Card ─────────────────────────────────────────
                 AnimatedFeedbackCard(
                     feedback     = uiState.feedback,
-                    currentState = uiState.currentState,
                     stepTitle    = viewModel.uiState.value.skill?.steps
                         ?.getOrNull(uiState.currentStepIndex)?.instruction ?: "",
                 )
@@ -181,8 +177,8 @@ fun LivePracticeScreen(
 private fun PracticeTopBar(
     skillName: String,
     state: TaskState,
+    visionMode: VisionMode,
     durationSec: Int,
-    confidence: Float,
     onPause: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -209,17 +205,32 @@ private fun PracticeTopBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         IconButton(onClick = onBack) {
-            Icon(Icons.Filled.ArrowBack, "Back", tint = ColorOnBackground)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = ColorOnBackground)
         }
 
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text  = skillName,
-                style = MaterialTheme.typography.titleSmall,
-                color = ColorOnBackground,
-            )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Pulsing live indicator
+                Text(
+                    text  = skillName,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = ColorOnBackground,
+                )
+                Spacer(Modifier.width(8.dp))
+                // Mode indicator badge
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = if (visionMode == VisionMode.MODEL_ACTIVE) ColorCorrect.copy(alpha = 0.15f) else ColorPrimary.copy(alpha = 0.15f),
+                ) {
+                    Text(
+                        text = if (visionMode == VisionMode.MODEL_ACTIVE) "AI MODEL" else "BENCHMARK VISION",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (visionMode == VisionMode.MODEL_ACTIVE) ColorCorrect else ColorPrimary,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
                     initialValue = 0.6f, targetValue = 1f,
                     animationSpec = infiniteRepeatable(
@@ -273,10 +284,7 @@ private fun CameraPreviewWithOverlay(
     detectedObjects: List<DetectedObject>,
     currentState: TaskState,
 ) {
-    val ext = SkillLensThemeTokens.colors
-
     Box(modifier = Modifier.fillMaxSize()) {
-        // Camera preview
         AndroidView(
             factory = { ctx ->
                 PreviewView(ctx).apply {
@@ -293,7 +301,6 @@ private fun CameraPreviewWithOverlay(
             modifier = Modifier.fillMaxSize(),
         )
 
-        // Detection bounding boxes overlay
         Canvas(modifier = Modifier.fillMaxSize()) {
             for (obj in detectedObjects) {
                 val bb = obj.boundingBox
@@ -302,31 +309,34 @@ private fun CameraPreviewWithOverlay(
                 val right  = bb.right * size.width
                 val bottom = bb.bottom * size.height
 
+                val isTerminal = obj.label.contains("terminal")
+                val isError = (currentState == TaskState.WRONG_CONNECTION || currentState == TaskState.WRONG_COMPONENT) &&
+                        (obj.label.contains("l1") || obj.label.contains("l2"))
+
                 val color = when {
-                    currentState == TaskState.WRONG_CONNECTION ||
-                    currentState == TaskState.WRONG_COMPONENT -> ColorBoundingBoxError
-                    obj.confidence > 0.7f                     -> ColorBoundingBoxActive
-                    else                                      -> ColorBoundingBoxIdle
+                    isError                                 -> ColorBoundingBoxError
+                    isTerminal                              -> ColorSecondary.copy(alpha = 0.8f)
+                    obj.confidence > 0.75f                  -> ColorBoundingBoxActive
+                    else                                    -> ColorBoundingBoxIdle
                 }
 
-                // Bounding box
                 drawRoundRect(
                     color        = color,
                     topLeft      = Offset(left, top),
-                    size         = Size(right - left, bottom - top),
+                    size         = Size((right - left).coerceAtLeast(10f), (bottom - top).coerceAtLeast(10f)),
                     cornerRadius = CornerRadius(4.dp.toPx()),
-                    style        = Stroke(width = 2.dp.toPx()),
+                    style        = Stroke(width = if (isTerminal) 1.5.dp.toPx() else 2.dp.toPx()),
                 )
 
-                // Label background
+                val labelText = obj.label.replace("_", " ").uppercase()
                 drawRoundRect(
                     color        = color.copy(alpha = 0.85f),
-                    topLeft      = Offset(left, top - 24.dp.toPx()),
+                    topLeft      = Offset(left, (top - 20.dp.toPx()).coerceAtLeast(0f)),
                     size         = Size(
-                        (obj.label.length * 8 + 16).dp.toPx().coerceAtMost(right - left),
-                        22.dp.toPx()
+                        (labelText.length * 7 + 12).dp.toPx().coerceAtMost(size.width - left),
+                        18.dp.toPx()
                     ),
-                    cornerRadius = CornerRadius(4.dp.toPx()),
+                    cornerRadius = CornerRadius(3.dp.toPx()),
                 )
             }
         }
@@ -334,7 +344,7 @@ private fun CameraPreviewWithOverlay(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HUD Corner Brackets — engineering feel
+// HUD Corner Brackets
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -344,20 +354,18 @@ private fun HudCornerBrackets(modifier: Modifier = Modifier) {
         val stroke    = Stroke(width = 2.dp.toPx())
         val color     = ColorHudCorner
 
-        // Top-left
         drawLine(color, Offset(0f, 0f), Offset(cornerLen, 0f), stroke.width)
         drawLine(color, Offset(0f, 0f), Offset(0f, cornerLen), stroke.width)
-        // Top-right
+
         drawLine(color, Offset(size.width, 0f), Offset(size.width - cornerLen, 0f), stroke.width)
         drawLine(color, Offset(size.width, 0f), Offset(size.width, cornerLen), stroke.width)
-        // Bottom-left
+
         drawLine(color, Offset(0f, size.height), Offset(cornerLen, size.height), stroke.width)
         drawLine(color, Offset(0f, size.height), Offset(0f, size.height - cornerLen), stroke.width)
-        // Bottom-right
+
         drawLine(color, Offset(size.width, size.height), Offset(size.width - cornerLen, size.height), stroke.width)
         drawLine(color, Offset(size.width, size.height), Offset(size.width, size.height - cornerLen), stroke.width)
 
-        // Center crosshair
         val cx = size.width / 2; val cy = size.height / 2; val ch = 12.dp.toPx()
         val dashEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f))
         drawLine(ColorHudLine, Offset(cx - ch, cy), Offset(cx + ch, cy), 1.dp.toPx(), pathEffect = dashEffect)
@@ -435,7 +443,6 @@ private fun StepProgressBar(
 @Composable
 private fun AnimatedFeedbackCard(
     feedback: com.skilllens.app.taskengine.FeedbackEvent?,
-    currentState: TaskState,
     stepTitle: String,
 ) {
     val ext = SkillLensThemeTokens.colors
@@ -472,7 +479,7 @@ private fun AnimatedFeedbackCard(
                 Spacer(Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text      = fb?.title ?: "Waiting...",
+                        text      = fb?.title ?: "Observing Task...",
                         style     = MaterialTheme.typography.titleSmall,
                         color     = ColorOnBackground,
                         fontWeight = FontWeight.Bold,
@@ -591,10 +598,6 @@ private fun PausedOverlay(onResume: () -> Unit, onQuit: () -> Unit) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper composables
-// ─────────────────────────────────────────────────────────────────────────────
-
 @Composable
 private fun PermissionDeniedContent(onRequestPermission: () -> Unit, onBack: () -> Unit) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -620,7 +623,7 @@ private fun LoadingContent() {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator(color = ColorPrimary)
             Spacer(Modifier.height(16.dp))
-            Text("Loading models...", style = MaterialTheme.typography.bodyMedium, color = ColorTextMuted)
+            Text("Initializing On-Device Vision...", style = MaterialTheme.typography.bodyMedium, color = ColorTextMuted)
         }
     }
 }

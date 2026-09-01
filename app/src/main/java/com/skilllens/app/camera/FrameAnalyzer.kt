@@ -15,15 +15,16 @@ import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
+import kotlin.math.abs
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FrameAnalyzer — bridge between CameraX ImageAnalysis and VisionEngine
 //
-// Performance & Memory Strategy:
+// Performance & Quality Strategy:
 //   - Camera runs at 30 FPS preview
-//   - Adaptive sampling intervals: only sample when inference is ready
-//   - Guard against concurrent inference via isProcessingFrame
-//   - Strictly recycle all intermediate Bitmaps to prevent OOM
+//   - Target 640x480 analysis stream with single-flight concurrency lock
+//   - Comprehensive FrameQuality assessment (Luminance + Edge Gradient variance)
+//   - Guaranteed immediate Bitmap memory recycling
 // ─────────────────────────────────────────────────────────────────────────────
 
 class FrameAnalyzer @Inject constructor(
@@ -37,16 +38,13 @@ class FrameAnalyzer @Inject constructor(
     private var currentInterval = INFERENCE_INTERVAL_FRAMES
     private var lastFrameWasActive = false
 
-    // Concurrency guard: Ensure single-flight ML inference
     private val isProcessingFrame = AtomicBoolean(false)
-
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     override fun analyze(image: ImageProxy) {
         frameCount++
 
         try {
-            // Drop frame if cadence interval not met OR previous inference is still in-flight
             if (frameCount % currentInterval != 0 || isProcessingFrame.get()) {
                 return
             }
@@ -84,25 +82,46 @@ class FrameAnalyzer @Inject constructor(
         }
     }
 
+    /**
+     * Assesses frame quality:
+     * - Checks average luminance (low light vs washed out glare)
+     * - Checks edge variance (gradient contrast) to detect motion blur
+     */
     private fun assessFrameQuality(bitmap: Bitmap): FrameQuality {
         val sample = Bitmap.createScaledBitmap(bitmap, 64, 64, false)
         var totalLum = 0L
-        for (x in 0 until sample.width) {
-            for (y in 0 until sample.height) {
+        var totalGradient = 0L
+
+        val lumArray = IntArray(64 * 64)
+
+        for (y in 0 until 64) {
+            for (x in 0 until 64) {
                 val pixel = sample.getPixel(x, y)
                 val r = (pixel shr 16) and 0xFF
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
-                totalLum += (0.299 * r + 0.587 * g + 0.114 * b).toLong()
+                val lum = (0.299 * r + 0.587 * g + 0.114 * b).toInt()
+                lumArray[y * 64 + x] = lum
+                totalLum += lum
+
+                if (x > 0 && y > 0) {
+                    val prevX = lumArray[y * 64 + (x - 1)]
+                    val prevY = lumArray[(y - 1) * 64 + x]
+                    val grad = abs(lum - prevX) + abs(lum - prevY)
+                    totalGradient += grad
+                }
             }
         }
         sample.recycle()
+
         val avgLum = totalLum / (64 * 64)
+        val avgGrad = totalGradient / (63 * 63)
 
         return when {
-            avgLum < 30  -> FrameQuality.LOW_LIGHT
-            avgLum > 240 -> FrameQuality.FRAMING_BAD
-            else         -> FrameQuality.GOOD
+            avgLum < 25   -> FrameQuality.LOW_LIGHT
+            avgLum > 245  -> FrameQuality.FRAMING_BAD
+            avgGrad < 4   -> FrameQuality.BLURRY // Very low contrast / severe blur
+            else          -> FrameQuality.GOOD
         }
     }
 

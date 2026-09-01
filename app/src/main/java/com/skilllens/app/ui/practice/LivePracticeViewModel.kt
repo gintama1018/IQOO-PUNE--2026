@@ -19,6 +19,7 @@ import com.skilllens.app.taskengine.StateMachine
 import com.skilllens.app.taskengine.TaskState
 import com.skilllens.app.taskengine.ValidationResult
 import com.skilllens.app.vision.VisionEngine
+import com.skilllens.app.vision.VisionMode
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -48,6 +49,7 @@ data class PracticeUiState(
     val isPaused: Boolean                    = false,
     val isCompleted: Boolean                 = false,
     val error: String?                       = null,
+    val visionMode: VisionMode               = VisionMode.CALIBRATED_BENCHMARK,
 )
 
 @HiltViewModel
@@ -66,7 +68,6 @@ class LivePracticeViewModel @Inject constructor(
     private var activeElapsedSeconds: Int = 0
     private var frameAnalyzer: FrameAnalyzer? = null
 
-    // Accumulate session step observations for history & scoring
     private val recordedStepResults = mutableListOf<StepResultEntity>()
     private var errorCount = 0
     private var correctionCount = 0
@@ -88,7 +89,15 @@ class LivePracticeViewModel @Inject constructor(
             skill        = skill,
             totalSteps   = skill.steps.size,
             currentState = TaskState.STEP_1_IDENTIFY,
+            visionMode   = visionEngine.visionMode.value,
         )
+
+        // Observe vision mode
+        viewModelScope.launch {
+            visionEngine.visionMode.collectLatest { mode ->
+                _uiState.value = _uiState.value.copy(visionMode = mode)
+            }
+        }
 
         // Observe state machine output
         viewModelScope.launch {
@@ -149,7 +158,6 @@ class LivePracticeViewModel @Inject constructor(
             }
         }
 
-        // Track errors and step progress
         val isError = result.newState in listOf(
             TaskState.WRONG_CONNECTION,
             TaskState.WRONG_COMPONENT,
@@ -162,7 +170,6 @@ class LivePracticeViewModel @Inject constructor(
             correctionCount++
         }
 
-        // Record step verification
         if (result.stateChanged && result.stepIndex != lastRecordedStepIndex && !isError) {
             lastRecordedStepIndex = result.stepIndex
             sessionId?.let { sid ->

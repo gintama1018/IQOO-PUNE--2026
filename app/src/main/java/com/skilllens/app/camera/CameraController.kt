@@ -1,11 +1,13 @@
 package com.skilllens.app.camera
 
 import android.content.Context
+import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -24,7 +26,7 @@ import javax.inject.Singleton
 //
 // Design decisions:
 // - Back camera only (task board is in front of the user, phone pointed at it)
-// - Preview at screen resolution; analysis at reduced resolution (640×480 target)
+// - Preview at screen resolution; analysis explicitly targeted at 640×480
 // - Single-thread executor for ImageAnalysis (prevents frame backlog)
 // - STRATEGY_KEEP_ONLY_LATEST: discard frames when analyzer is busy
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +47,6 @@ class CameraController @Inject constructor(
     private val _status = MutableStateFlow(CameraStatus.IDLE)
     val status: StateFlow<CameraStatus> = _status.asStateFlow()
 
-    // Single-thread executor — one frame at a time, newest wins
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private var cameraProvider: ProcessCameraProvider? = null
 
@@ -75,10 +76,14 @@ class CameraController @Inject constructor(
                     .build()
                     .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-                // ── Analysis use-case ─────────────────────────────────────────
-                // Target 640×480 for ML inference — balance between speed and quality.
-                // STRATEGY_KEEP_ONLY_LATEST = never queue frames, drop stale ones.
+                // ── Analysis use-case: Explicit 640×480 target ────────────────
                 val resolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(640, 480),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
                     .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                     .build()
 
@@ -99,7 +104,7 @@ class CameraController @Inject constructor(
                 )
 
                 _status.value = CameraStatus.RUNNING
-                Timber.d("CameraController: Camera bound successfully")
+                Timber.d("CameraController: Camera bound successfully at target 640x480 analysis")
 
             } catch (e: Exception) {
                 Timber.e(e, "CameraController: Failed to bind camera")
@@ -120,8 +125,7 @@ class CameraController @Inject constructor(
     }
 
     /**
-     * Shut down the analysis thread pool.
-     * Call only when the entire camera session is permanently done.
+     * Shut down the analysis thread pool on application termination.
      */
     fun shutdown() {
         stopCamera()
