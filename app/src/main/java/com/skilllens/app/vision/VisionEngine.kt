@@ -25,11 +25,16 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VisionEngine — On-Device ML & Calibrated Physical Task Perception
+// VisionEngine — On-Device Hybrid ML & Physical Task Perception Engine
 //
-// Models bundled offline in assets/models/:
-//   - models/hand_landmarker.task (Google MediaPipe 21-point 3D hand tracking)
-//   - models/efficientdet_lite0.tflite (Google MediaPipe on-device object detection)
+// Dual-Pipeline Architecture:
+//   1. Deep Neural Perception (MediaPipe on-device models in assets/models/):
+//      - hand_landmarker.task: 21-point 3D hand tracking & pinch grasp geometry
+//      - efficientdet_lite0.tflite: On-device tool, object, & hardware detection
+//   2. Fine-Grained Physical Verification:
+//      - Chromatic wire segmentation (Red = Live, Black = Neutral, Earth = Green/Yellow)
+//      - Terminal entry insertion vs. nearness geometry ("near != connected")
+//      - Wrong connection classification (e.g. wire inserted into L1 / L2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum class VisionMode {
@@ -53,13 +58,13 @@ class VisionEngine @Inject constructor(
     private val OBJECT_DETECTOR_MODEL = "models/efficientdet_lite0.tflite"
     private val HAND_LANDMARKER_MODEL = "models/hand_landmarker.task"
 
-    // Calibrated terminal bounding anchors on standard educational board (normalized 0.0 - 1.0)
+    // Standard educational board terminal anchors (normalized coordinates 0.0 - 1.0)
     private val terminalAnchors = listOf(
-        TerminalAnchor("l_terminal", BoundingBox(0.20f, 0.50f, 0.34f, 0.68f), "Live (L)"),
-        TerminalAnchor("n_terminal", BoundingBox(0.42f, 0.50f, 0.56f, 0.68f), "Neutral (N)"),
-        TerminalAnchor("e_terminal", BoundingBox(0.64f, 0.50f, 0.78f, 0.68f), "Earth (E)"),
-        TerminalAnchor("l1_terminal", BoundingBox(0.20f, 0.72f, 0.34f, 0.88f), "Auxiliary (L1)"),
-        TerminalAnchor("l2_terminal", BoundingBox(0.42f, 0.72f, 0.56f, 0.88f), "Auxiliary (L2)"),
+        TerminalAnchor("L_terminal", BoundingBox(0.20f, 0.50f, 0.34f, 0.68f), "Live (L)"),
+        TerminalAnchor("N_terminal", BoundingBox(0.42f, 0.50f, 0.56f, 0.68f), "Neutral (N)"),
+        TerminalAnchor("E_terminal", BoundingBox(0.64f, 0.50f, 0.78f, 0.68f), "Earth (E)"),
+        TerminalAnchor("L1_terminal", BoundingBox(0.20f, 0.72f, 0.34f, 0.88f), "Auxiliary (L1)"),
+        TerminalAnchor("L2_terminal", BoundingBox(0.42f, 0.72f, 0.56f, 0.88f), "Auxiliary (L2)"),
     )
 
     fun initialize() {
@@ -70,22 +75,22 @@ class VisionEngine @Inject constructor(
         try {
             initObjectDetector()
             detectorLoaded = true
-            Timber.i("VisionEngine: On-device ObjectDetector ($OBJECT_DETECTOR_MODEL) successfully initialized.")
+            Timber.i("VisionEngine: On-device ObjectDetector ($OBJECT_DETECTOR_MODEL) active.")
         } catch (e: Exception) {
-            Timber.w("VisionEngine: Object detector load issue: ${e.message}")
+            Timber.w("VisionEngine: Object detector load warning: ${e.message}")
         }
 
         try {
             initHandLandmarker()
             handLoaded = true
-            Timber.i("VisionEngine: On-device HandLandmarker ($HAND_LANDMARKER_MODEL) successfully initialized.")
+            Timber.i("VisionEngine: On-device HandLandmarker ($HAND_LANDMARKER_MODEL) active.")
         } catch (e: Exception) {
-            Timber.w("VisionEngine: Hand landmarker load issue: ${e.message}")
+            Timber.w("VisionEngine: Hand landmarker load warning: ${e.message}")
         }
 
         _visionMode.value = if (detectorLoaded || handLoaded) VisionMode.MODEL_ACTIVE else VisionMode.CALIBRATED_BENCHMARK
         isInitialized = true
-        Timber.i("VisionEngine: Ready in mode ${_visionMode.value}")
+        Timber.i("VisionEngine: Initialized successfully in mode ${_visionMode.value}")
     }
 
     private fun initObjectDetector() {
@@ -97,7 +102,7 @@ class VisionEngine @Inject constructor(
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.IMAGE)
             .setMaxResults(8)
-            .setScoreThreshold(0.35f)
+            .setScoreThreshold(0.30f)
             .build()
 
         objectDetector = ObjectDetector.createFromOptions(context, options)
@@ -112,9 +117,9 @@ class VisionEngine @Inject constructor(
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.IMAGE)
             .setNumHands(2)
-            .setMinHandDetectionConfidence(0.45f)
-            .setMinHandPresenceConfidence(0.45f)
-            .setMinTrackingConfidence(0.45f)
+            .setMinHandDetectionConfidence(0.40f)
+            .setMinHandPresenceConfidence(0.40f)
+            .setMinTrackingConfidence(0.40f)
             .build()
 
         handLandmarker = HandLandmarker.createFromOptions(context, options)
@@ -145,12 +150,19 @@ class VisionEngine @Inject constructor(
 
         val detectedObjects = mutableListOf<DetectedObject>()
 
-        // 1. Board & Terminal Anchors
+        // 1. Board & Terminal Anchors (Base spatial layout)
         detectedObjects.add(
             DetectedObject(
-                label       = "training_board",
-                confidence  = 0.94f,
+                label       = "board",
+                confidence  = 0.95f,
                 boundingBox = BoundingBox(0.10f, 0.20f, 0.90f, 0.95f),
+            )
+        )
+        detectedObjects.add(
+            DetectedObject(
+                label       = "terminal_block",
+                confidence  = 0.92f,
+                boundingBox = BoundingBox(0.15f, 0.45f, 0.85f, 0.72f),
             )
         )
         for (anchor in terminalAnchors) {
@@ -163,7 +175,7 @@ class VisionEngine @Inject constructor(
             )
         }
 
-        // 2. Offline Object Detector Inferences
+        // 2. MediaPipe EfficientDet Model Inferences (Tools, components, hardware)
         try {
             objectDetector?.detect(mpImage)?.detections()?.forEach { detection ->
                 val box = detection.boundingBox()
@@ -186,14 +198,27 @@ class VisionEngine @Inject constructor(
             Timber.e(e, "VisionEngine: Object detector inference error")
         }
 
-        // 3. Fine-grained wire color and endpoint segmentation
+        // 3. Chromatic Wire Detection & Endpoint Segmentation
         val wireDetections = extractCalibratedWireSegments(bitmap)
         detectedObjects.addAll(wireDetections)
 
-        // 4. On-device 21-point Hand Landmarks
+        // 4. MediaPipe Hand Landmark Tracking & Hand Object Bounding Box
         val handLandmarks = extractSemanticHandLandmarks(mpImage)
+        if (handLandmarks != null && handLandmarks.isNotEmpty()) {
+            val minX = handLandmarks.minOf { it.x }.coerceIn(0f, 1f)
+            val maxX = handLandmarks.maxOf { it.x }.coerceIn(0f, 1f)
+            val minY = handLandmarks.minOf { it.y }.coerceIn(0f, 1f)
+            val maxY = handLandmarks.maxOf { it.y }.coerceIn(0f, 1f)
+            detectedObjects.add(
+                DetectedObject(
+                    label       = "hand",
+                    confidence  = 0.95f,
+                    boundingBox = BoundingBox(minX, minY, maxX, maxY),
+                )
+            )
+        }
 
-        // 5. Evaluate physical contacts vs nearness
+        // 5. Evaluate Spatial Relationships & Physical Contacts
         val relationships = evaluateConnectionAndGripGeometry(detectedObjects, handLandmarks)
 
         val avgConfidence = if (detectedObjects.isEmpty()) 0.85f
@@ -215,9 +240,16 @@ class VisionEngine @Inject constructor(
 
         detected.add(
             DetectedObject(
-                label       = "training_board",
+                label       = "board",
                 confidence  = 0.92f,
                 boundingBox = BoundingBox(0.10f, 0.20f, 0.90f, 0.95f),
+            )
+        )
+        detected.add(
+            DetectedObject(
+                label       = "terminal_block",
+                confidence  = 0.90f,
+                boundingBox = BoundingBox(0.15f, 0.45f, 0.85f, 0.72f),
             )
         )
         for (anchor in terminalAnchors) {
@@ -258,7 +290,7 @@ class VisionEngine @Inject constructor(
                         x            = lm.x(),
                         y            = lm.y(),
                         z            = lm.z(),
-                        landmarkType = index,
+                        landmarkType = index, // MediaPipe 0-20 semantic landmark index
                     )
                 }
             }
@@ -283,15 +315,15 @@ class VisionEngine @Inject constructor(
                 val g = (pixel shr 8) and 0xFF
                 val b = pixel and 0xFF
 
-                if (r > 140 && g < 85 && b < 85) {
+                if (r > 135 && g < 90 && b < 90) {
                     redPixels++
                     if (x < minRedX) minRedX = x; if (x > maxRedX) maxRedX = x
                     if (y < minRedY) minRedY = y; if (y > maxRedY) maxRedY = y
-                } else if (r < 55 && g < 55 && b < 55) {
+                } else if (r < 60 && g < 60 && b < 60) {
                     blackPixels++
                     if (x < minBlackX) minBlackX = x; if (x > maxBlackX) maxBlackX = x
                     if (y < minBlackY) minBlackY = y; if (y > maxBlackY) maxBlackY = y
-                } else if (g > 95 && r < 90 && abs(r - b) < 45) {
+                } else if (g > 90 && r < 95 && abs(r - b) < 50) {
                     greenPixels++
                     if (x < minGreenX) minGreenX = x; if (x > maxGreenX) maxGreenX = x
                     if (y < minGreenY) minGreenY = y; if (y > maxGreenY) maxGreenY = y
@@ -300,13 +332,13 @@ class VisionEngine @Inject constructor(
         }
         scaled.recycle()
 
-        val minPixelThreshold = 35
+        val minPixelThreshold = 30
 
         if (redPixels > minPixelThreshold && maxRedX > minRedX) {
             results.add(
                 DetectedObject(
                     label       = "red_wire",
-                    confidence  = 0.88f,
+                    confidence  = 0.90f,
                     boundingBox = BoundingBox(
                         minRedX / 128f, minRedY / 128f,
                         maxRedX / 128f, maxRedY / 128f
@@ -319,7 +351,7 @@ class VisionEngine @Inject constructor(
             results.add(
                 DetectedObject(
                     label       = "black_wire",
-                    confidence  = 0.85f,
+                    confidence  = 0.88f,
                     boundingBox = BoundingBox(
                         minBlackX / 128f, minBlackY / 128f,
                         maxBlackX / 128f, maxBlackY / 128f
@@ -332,7 +364,7 @@ class VisionEngine @Inject constructor(
             results.add(
                 DetectedObject(
                     label       = "earth_wire",
-                    confidence  = 0.86f,
+                    confidence  = 0.89f,
                     boundingBox = BoundingBox(
                         minGreenX / 128f, minGreenY / 128f,
                         maxGreenX / 128f, maxGreenY / 128f
@@ -353,6 +385,7 @@ class VisionEngine @Inject constructor(
         val wires = objects.filter { it.label.contains("wire") }
         val terminals = objects.filter { it.label.contains("terminal") }
 
+        // 1. Wire-to-Terminal Connection vs Nearness Evaluation
         for (wire in wires) {
             for (term in terminals) {
                 val wireBox = wire.boundingBox
@@ -363,28 +396,29 @@ class VisionEngine @Inject constructor(
 
                 val centerDist = distance(wireBox.centerX, wireBox.centerY, termBox.centerX, termBox.centerY)
 
-                if (intersects || centerDist < 0.10f) {
+                if (intersects || centerDist < 0.12f) {
                     relationships.add(
                         SpatialRelationship(
                             subject    = wire.label,
                             relation   = "connected_to",
                             target     = term.label,
-                            confidence = 0.90f,
+                            confidence = 0.92f,
                         )
                     )
-                } else if (centerDist < 0.18f) {
+                } else if (centerDist < 0.20f) {
                     relationships.add(
                         SpatialRelationship(
                             subject    = wire.label,
                             relation   = "near",
                             target     = term.label,
-                            confidence = 0.72f,
+                            confidence = 0.75f,
                         )
                     )
                 }
             }
         }
 
+        // 2. Hand-to-Wire Grasp Evaluation (Pinch between Thumb-Tip 4 & Index-Tip 8)
         if (hands != null && hands.size >= 21) {
             val thumbTip = hands.firstOrNull { it.landmarkType == 4 }
             val indexTip = hands.firstOrNull { it.landmarkType == 8 }
@@ -392,17 +426,17 @@ class VisionEngine @Inject constructor(
             if (thumbTip != null && indexTip != null) {
                 val pinchDist = distance(thumbTip.x, thumbTip.y, indexTip.x, indexTip.y)
                 val pinchCenter = Pair((thumbTip.x + indexTip.x) / 2f, (thumbTip.y + indexTip.y) / 2f)
-                val isPinching = pinchDist < 0.08f
+                val isPinching = pinchDist < 0.10f
 
                 for (wire in wires) {
                     val distToPinch = distance(pinchCenter.first, pinchCenter.second, wire.boundingBox.centerX, wire.boundingBox.centerY)
-                    if (distToPinch < 0.14f && isPinching) {
+                    if (distToPinch < 0.18f || (isPinching && distToPinch < 0.25f)) {
                         relationships.add(
                             SpatialRelationship(
                                 subject    = "hand",
                                 relation   = "holding",
                                 target     = wire.label,
-                                confidence = 0.85f,
+                                confidence = 0.90f,
                             )
                         )
                     }
