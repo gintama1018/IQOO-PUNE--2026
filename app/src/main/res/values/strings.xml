@@ -1,0 +1,45 @@
+<resources>
+    <string name="app_name">SkillLens</string>
+    <string name="app_tagline">Your phone watches you learn.</string>
+    <string name="app_description">Real-time practical skill verification for Android.</string>
+
+    <!-- Permissions -->
+    <string name="camera_rationale">SkillLens needs camera access to observe your physical task and provide real-time feedback.</string>
+
+    <!-- Navigation -->
+    <string name="home">Home</string>
+    <string name="choose_skill">Choose Skill</string>
+    <string name="history">History</string>
+    <string name="settings">Settings</string>
+    <string name="about">About</string>
+
+    <!-- Practice -->
+    <string name="start_practice">Start Practice</string>
+    <string name="begin_practice">Begin Practice</string>
+    <string name="practice_complete">Practice Complete</string>
+    <string name="practice_paused">Practice Paused</string>
+    <string name="camera_setup">Camera Setup</string>
+    <string name="resume">Resume</string>
+    <string name="pause">Pause</string>
+    <string name="reset">Reset</string>
+    <string name="quit_session">Quit Session</string>
+    <string name="practice_again">Practice Again</string>
+    <string name="go_home">Go Home</string>
+
+    <!-- Feedback -->
+    <string name="step_verified">Step Verified</string>
+    <string name="wrong_connection">Wrong Connection</string>
+    <string name="adjust_view">Adjust View</string>
+    <string name="cant_see_clearly">Can\'t see clearly</string>
+    <string name="move_closer">Move the phone closer and hold steady.</string>
+    <string name="task_complete">Task Complete</string>
+    <string name="all_steps_verified">All steps verified. Excellent work!</string>
+
+    <!-- Safety -->
+    <string name="safety_warning">Use ONLY a safe low-voltage educational training board. Never perform this on live mains electricity.</string>
+    <string name="not_certified">This is a hackathon prototype. It is not a certified training tool.</string>
+
+    <!-- Hackathon -->
+    <string name="hackathon_name">iQOO Hackathon 2026</string>
+    <string name="hackathon_track">Smart Education / Open Innovation</string>
+</resources>
