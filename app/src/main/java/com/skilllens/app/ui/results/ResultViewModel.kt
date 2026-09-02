@@ -50,7 +50,7 @@ class ResultViewModel @Inject constructor(
 
             val score = session?.score ?: 88
             val total = skill?.steps?.size ?: 6
-            val correct = stepResults.count { it.isCorrect }.coerceAtLeast(total - 1)
+            val correct = stepResults.count { it.isCorrect }
             val corrections = stepResults.count { !it.isCorrect }.coerceAtLeast(0)
 
             _uiState.value = ResultUiState(

@@ -251,7 +251,10 @@ class LivePracticeViewModel @Inject constructor(
         val accuracyScore = rawAccuracy * weights.accuracyWeight
 
         // 3. Sequence fidelity component (15% default)
-        val sequenceScore = 100f * weights.sequenceWeight
+        // Each error/wrong-state event reduces sequence fidelity. This is distinct
+        // from the accuracy penalty — accuracy counts errors as a flat deduction,
+        // sequence counts how cleanly the user flowed through the steps in order.
+        val sequenceScore = (100f - (errorCount * 15f)).coerceIn(0f, 100f) * weights.sequenceWeight
 
         // 4. Speed / efficiency component (10% default)
         val targetSeconds = (skill.estimatedDurationMin * 60).coerceAtLeast(60)

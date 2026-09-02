@@ -100,9 +100,10 @@ class Validator @Inject constructor() {
         detectedLabels: List<String>,
         relationships: List<SpatialRelationship>,
     ): ValidatorResult? {
-        // Check for wrong-terminal connections
         for (errorPattern in step.errorStates) {
             when {
+                // ── WRONG CONNECTION ────────────────────────────────────────────
+                // Wire is physically connected to a terminal that this step doesn't require.
                 errorPattern.contains("wrong_connection") -> {
                     val wrongTerminals = listOf("l1", "l2", "l3").filter { terminal ->
                         relationships.any { rel ->
@@ -130,9 +131,19 @@ class Validator @Inject constructor() {
                     }
                 }
 
+                // ── WRONG COMPONENT ─────────────────────────────────────────────
+                // A known physical object is detected that is not part of this step.
+                // Previously dead code: old filter used label.contains("component") which
+                // never matched any actual label (board/wire/terminal/hand). Fixed to use
+                // the actual label vocabulary.
                 errorPattern.contains("wrong_component") -> {
+                    val knownPhysicalLabels = setOf(
+                        "red_wire", "black_wire", "earth_wire",
+                        "l_terminal", "n_terminal", "e_terminal",
+                        "hand", "board", "terminal_block",
+                    )
                     val unexpectedComponents = detectedLabels.filter { label ->
-                        label.contains("component") &&
+                        knownPhysicalLabels.any { known -> label.contains(known) } &&
                                 step.requiredObjects.none { req -> label.contains(req.lowercase()) }
                     }
                     if (unexpectedComponents.isNotEmpty()) {
@@ -140,8 +151,60 @@ class Validator @Inject constructor() {
                             proposedState = TaskState.WRONG_COMPONENT,
                             feedback = FeedbackEvent(
                                 type    = FeedbackType.ERROR,
-                                title   = "⚠ Wrong Component",
-                                message = "That is not the correct component for this step.",
+                                title   = "⚠ Not the Right Item",
+                                message = "That's not needed for this step. " +
+                                        "Focus on: ${step.requiredObjects.joinToString(", ")}.",
+                                hapticPattern = HapticPattern.ERROR,
+                                isCorrection  = true,
+                            ),
+                            matchedObjects = emptyList(),
+                        )
+                    }
+                }
+
+                // ── OUT OF ORDER ─────────────────────────────────────────────────
+                // Hand is holding a wire type that is NOT expected for the current step.
+                // Gated on the holding *relationship* (not label presence), so all-wires-
+                // visible-in-frame doesn't trigger false positives.
+                errorPattern.contains("out_of_order") -> {
+                    val heldWires = relationships
+                        .filter { it.subject == "hand" && it.relation == "holding" }
+                        .map { it.target.lowercase() }
+
+                    val wrongHeldWires = heldWires.filter { wire ->
+                        step.requiredObjects.none { req -> wire.contains(req.lowercase()) }
+                    }
+                    if (wrongHeldWires.isNotEmpty()) {
+                        val wireDisplay = wrongHeldWires.first().replace("_", " ")
+                        return ValidatorResult(
+                            proposedState = TaskState.OUT_OF_ORDER,
+                            feedback = FeedbackEvent(
+                                type    = FeedbackType.ERROR,
+                                title   = "⚠ Wrong Wire",
+                                message = "You're holding the $wireDisplay. " +
+                                        "Put it down and pick up the correct wire for this step.",
+                                hapticPattern = HapticPattern.ERROR,
+                                isCorrection  = true,
+                            ),
+                            matchedObjects = emptyList(),
+                        )
+                    }
+                }
+
+                // ── MISSING COMPONENT ────────────────────────────────────────────
+                // A required object for this step is absent from the frame entirely.
+                // Used in final verification (step 6) where all wires must be visible.
+                errorPattern.contains("missing_component") -> {
+                    val missingItems = step.requiredObjects.filter { required ->
+                        detectedLabels.none { it.contains(required.lowercase()) }
+                    }
+                    if (missingItems.isNotEmpty()) {
+                        return ValidatorResult(
+                            proposedState = TaskState.MISSING_COMPONENT,
+                            feedback = FeedbackEvent(
+                                type    = FeedbackType.ERROR,
+                                title   = "⚠ Missing Wire",
+                                message = "Cannot verify: ${missingItems.joinToString(", ")} not visible in frame.",
                                 hapticPattern = HapticPattern.ERROR,
                                 isCorrection  = true,
                             ),

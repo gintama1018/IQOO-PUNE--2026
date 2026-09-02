@@ -28,11 +28,13 @@ import kotlin.math.sqrt
 // VisionEngine — On-Device Hybrid ML & Physical Task Perception Engine
 //
 // Dual-Pipeline Architecture:
-//   1. Deep Neural Perception (MediaPipe on-device models in assets/models/):
-//      - hand_landmarker.task: 21-point 3D hand tracking & pinch grasp geometry
-//      - efficientdet_lite0.tflite: On-device tool, object, & hardware detection
-//   2. Fine-Grained Physical Verification:
-//      - Calibrated board-relative geometry with camera framing verification
+//   1. On-Device MediaPipe Models (assets/models/):
+//      - hand_landmarker.task  : 21-point 3D hand tracking & pinch grasp geometry
+//      - efficientdet_lite0.tflite : Auxiliary scene context only (90-class COCO;
+//        output quarantined to auxDetections — not used in task validation)
+//   2. Scene-Adaptive Physical Verification:
+//      - Luminance-mass board ROI detection (fails on uniform surfaces like blank
+//        walls; terminal zones are proportional anchors, not full localization)
 //      - Chromatic wire segmentation (Red = Live, Black = Neutral, Earth = Green/Yellow)
 //      - Terminal entry aperture insertion vs. nearness geometry ("near != connected")
 //      - Real-time occlusion detection (hands obscuring terminal inspection zone)
@@ -57,8 +59,18 @@ class VisionEngine @Inject constructor(
 
     private var isInitialized = false
 
+    // Movement-delta fallback state — tracks red wire tip across frames.
+    // Used to infer "holding" when hand landmarker is unavailable (partial failure).
+    private var prevRedTipX: Float? = null
+    private var prevRedTipY: Float? = null
+
     private val OBJECT_DETECTOR_MODEL = "models/efficientdet_lite0.tflite"
     private val HAND_LANDMARKER_MODEL = "models/hand_landmarker.task"
+
+    companion object {
+        /** Minimum normalized centroid movement to infer a wire is being held. */
+        private const val MOVEMENT_THRESHOLD = 0.04f
+    }
 
     fun initialize() {
         if (isInitialized) return
@@ -141,21 +153,33 @@ class VisionEngine @Inject constructor(
         val mpImage = BitmapImageBuilder(bitmap).build()
         val timestamp = System.currentTimeMillis()
 
-        val detectedObjects = mutableListOf<DetectedObject>()
+        // 1. Scene-Adaptive Board ROI — returns null when scene is too uniform (blank wall/ceiling)
+        val boardBox = detectBoardROI(bitmap) ?: run {
+            Timber.d("VisionEngine: Board ROI not detected — uniform scene")
+            return FrameObservation(
+                detectedObjects = emptyList(),
+                relationships   = emptyList(),
+                handLandmarks   = null,
+                frameTimestamp  = timestamp,
+                confidence      = 0.2f,  // Low confidence — nothing meaningful detected
+                frameQuality    = quality,
+            )
+        }
 
-        // 1. Dynamic Board ROI & Relative Terminal Anchors
-        val boardBox = detectBoardROI(bitmap)
+        val detectedObjects = mutableListOf<DetectedObject>()
+        val auxDetections   = mutableListOf<DetectedObject>()
+
         detectedObjects.add(
             DetectedObject(
                 label       = "board",
-                confidence  = 0.95f,
+                confidence  = boardBox.width * boardBox.height * 4f,  // confidence derived from detected ROI area
                 boundingBox = boardBox,
-            )
+            ).let { it.copy(confidence = it.confidence.coerceIn(0.60f, 0.96f)) }
         )
         detectedObjects.add(
             DetectedObject(
                 label       = "terminal_block",
-                confidence  = 0.92f,
+                confidence  = 0.88f,
                 boundingBox = BoundingBox(
                     boardBox.left + boardBox.width * 0.08f,
                     boardBox.top + boardBox.height * 0.35f,
@@ -170,19 +194,21 @@ class VisionEngine @Inject constructor(
             detectedObjects.add(
                 DetectedObject(
                     label       = anchor.id,
-                    confidence  = 0.90f,
+                    confidence  = 0.86f,
                     boundingBox = anchor.box,
                 )
             )
         }
 
-        // 2. MediaPipe EfficientDet Model Inferences (Tools, components, hardware)
+        // 2. EfficientDet COCO Inference — output quarantined to auxDetections.
+        //    Labels are 90-class COCO (person, cup, etc.) — no overlap with task
+        //    label vocabulary. Not forwarded to detectedObjects or Validator.
         try {
             objectDetector?.detect(mpImage)?.detections()?.forEach { detection ->
                 val box = detection.boundingBox()
                 val category = detection.categories().firstOrNull()
                 val label = category?.categoryName()?.lowercase() ?: "object"
-                detectedObjects.add(
+                auxDetections.add(
                     DetectedObject(
                         label       = label,
                         confidence  = category?.score() ?: 0.5f,
@@ -223,23 +249,28 @@ class VisionEngine @Inject constructor(
                 )
             )
 
-            // Check if hand covers terminal block directly during verification (Case 4: Occlusion)
             val coveredTerminals = dynamicAnchors.count { anchor ->
-                val centerInHand = anchor.box.centerX in handBox.left..handBox.right &&
+                anchor.box.centerX in handBox.left..handBox.right &&
                         anchor.box.centerY in handBox.top..handBox.bottom
-                centerInHand
             }
-            if (coveredTerminals >= 3) {
-                isOccluded = true
-            }
+            if (coveredTerminals >= 3) isOccluded = true
         }
 
         // 5. Evaluate Spatial Relationships & Physical Contacts
-        val relationships = evaluateConnectionAndGripGeometry(wireSegments, dynamicAnchors, handLandmarks)
+        val relationships = mutableListOf<SpatialRelationship>()
+        relationships.addAll(evaluateConnectionAndGripGeometry(wireSegments, dynamicAnchors, handLandmarks))
+
+        // 6. FALLBACK: Movement-delta wire-hold inference.
+        //    Activated when hand landmarker is unavailable (partial model-load failure).
+        //    handLandmarks == null even in MODEL_ACTIVE mode if hand model failed to load.
+        //    Presence alone is not sufficient — we require centroid movement to distinguish
+        //    a wire being actively held from one resting on the board.
+        if (handLandmarks == null) {
+            inferHoldFromMovement(wireSegments, relationships)
+        }
 
         val effectiveQuality = if (isOccluded) FrameQuality.OCCLUDED else quality
-
-        val avgConfidence = if (detectedObjects.isEmpty()) 0.85f
+        val avgConfidence = if (detectedObjects.isEmpty()) 0.2f
         else detectedObjects.map { it.confidence }.average().toFloat()
 
         return FrameObservation(
@@ -249,25 +280,40 @@ class VisionEngine @Inject constructor(
             frameTimestamp  = timestamp,
             confidence      = if (isOccluded) 0.35f else avgConfidence,
             frameQuality    = effectiveQuality,
+            auxDetections   = auxDetections,
         )
     }
 
     private fun analyzeWithCalibratedBenchmark(bitmap: Bitmap, quality: FrameQuality): FrameObservation {
-        val detected = mutableListOf<DetectedObject>()
+        val timestamp = System.currentTimeMillis()
+
+        // Scene-Adaptive Board ROI — null means scene is too uniform (blank wall/ceiling/sky)
+        val boardBox = detectBoardROI(bitmap) ?: run {
+            Timber.d("VisionEngine: Board ROI not detected (benchmark) — uniform scene")
+            return FrameObservation(
+                detectedObjects = emptyList(),
+                relationships   = emptyList(),
+                handLandmarks   = null,
+                frameTimestamp  = timestamp,
+                confidence      = 0.2f,
+                frameQuality    = quality,
+            )
+        }
+
+        val detected      = mutableListOf<DetectedObject>()
         val relationships = mutableListOf<SpatialRelationship>()
 
-        val boardBox = detectBoardROI(bitmap)
         detected.add(
             DetectedObject(
                 label       = "board",
-                confidence  = 0.92f,
+                confidence  = (boardBox.width * boardBox.height * 4f).coerceIn(0.60f, 0.93f),
                 boundingBox = boardBox,
             )
         )
         detected.add(
             DetectedObject(
                 label       = "terminal_block",
-                confidence  = 0.90f,
+                confidence  = 0.88f,
                 boundingBox = BoundingBox(
                     boardBox.left + boardBox.width * 0.08f,
                     boardBox.top + boardBox.height * 0.35f,
@@ -282,7 +328,7 @@ class VisionEngine @Inject constructor(
             detected.add(
                 DetectedObject(
                     label       = anchor.id,
-                    confidence  = 0.88f,
+                    confidence  = 0.85f,
                     boundingBox = anchor.box,
                 )
             )
@@ -293,17 +339,19 @@ class VisionEngine @Inject constructor(
             detected.add(wire.detectedObject)
         }
 
-        val connectionRels = evaluateConnectionAndGripGeometry(wireSegments, dynamicAnchors, null)
-        relationships.addAll(connectionRels)
+        relationships.addAll(evaluateConnectionAndGripGeometry(wireSegments, dynamicAnchors, null))
 
-        val avgConfidence = if (detected.isEmpty()) 0.5f
+        // FALLBACK: Movement-delta wire-hold inference (hand model not loaded in benchmark mode).
+        inferHoldFromMovement(wireSegments, relationships)
+
+        val avgConfidence = if (detected.isEmpty()) 0.2f
         else detected.map { it.confidence }.average().toFloat()
 
         return FrameObservation(
             detectedObjects = detected,
             relationships   = relationships,
             handLandmarks   = null,
-            frameTimestamp  = System.currentTimeMillis(),
+            frameTimestamp  = timestamp,
             confidence      = avgConfidence,
             frameQuality    = quality,
         )
@@ -313,9 +361,66 @@ class VisionEngine @Inject constructor(
      * Calibrated board-relative geometry with camera framing verification.
      * Evaluates central region visual presence and framing alignment.
      */
-    private fun detectBoardROI(bitmap: Bitmap): BoundingBox {
-        // Calibrated baseline board region (central workspace anchor)
-        return BoundingBox(0.12f, 0.22f, 0.88f, 0.92f)
+    /**
+     * Scene-adaptive board ROI detection using luminance-mass analysis.
+     *
+     * Scans a 64×64 downsample for non-uniform pixels (the training board has
+     * visible texture — terminal labels, screws, coloured terminal blocks).
+     * Uniform scenes (blank walls, ceilings, sky) fall below the minimum pixel
+     * mass and return null, preventing false board/terminal detections.
+     *
+     * @return Detected ROI as a normalized BoundingBox, or null if the scene is
+     *         too uniform to contain a plausible board surface.
+     */
+    private fun detectBoardROI(bitmap: Bitmap): BoundingBox? {
+        val W = 64; val H = 64
+        val scaled = Bitmap.createScaledBitmap(bitmap, W, H, false)
+
+        // Compute per-pixel luminance and track the mean for variance calculation
+        val luma = Array(H) { y -> FloatArray(W) { x ->
+            val px = scaled.getPixel(x, y)
+            val r  = (px shr 16 and 0xFF) / 255f
+            val g  = (px shr 8  and 0xFF) / 255f
+            val b  = (px        and 0xFF) / 255f
+            0.299f * r + 0.587f * g + 0.114f * b
+        }}
+        scaled.recycle()
+
+        // Global mean luminance
+        val meanLuma = luma.flatMap { it.toList() }.average().toFloat()
+
+        // Count "interesting" pixels: deviate from mean by more than the threshold.
+        // This distinguishes textured board surfaces from uniform walls/ceilings.
+        val varianceThreshold = 0.08f
+        val minInterestingPixels = W * H / 6   // at least ~17% of pixels must be non-uniform
+
+        var minX = W; var maxX = 0
+        var minY = H; var maxY = 0
+        var interestingCount = 0
+
+        for (y in 0 until H) {
+            for (x in 0 until W) {
+                if (abs(luma[y][x] - meanLuma) > varianceThreshold) {
+                    interestingCount++
+                    if (x < minX) minX = x; if (x > maxX) maxX = x
+                    if (y < minY) minY = y; if (y > maxY) maxY = y
+                }
+            }
+        }
+
+        if (interestingCount < minInterestingPixels || maxX <= minX || maxY <= minY) {
+            // Scene is too uniform — no board detected
+            return null
+        }
+
+        // Expand detected region with a small margin and clamp to frame
+        val margin = 0.04f
+        return BoundingBox(
+            left   = (minX.toFloat() / W - margin).coerceIn(0f, 1f),
+            top    = (minY.toFloat() / H - margin).coerceIn(0f, 1f),
+            right  = (maxX.toFloat() / W + margin).coerceIn(0f, 1f),
+            bottom = (maxY.toFloat() / H + margin).coerceIn(0f, 1f),
+        )
     }
 
     private fun computeDynamicTerminalAnchors(boardBox: BoundingBox): List<TerminalAnchor> {
@@ -556,12 +661,56 @@ class VisionEngine @Inject constructor(
         return sqrt((dx * dx + dy * dy).toDouble()).toFloat()
     }
 
+    /**
+     * Infers a "hand holding wire" relationship from frame-to-frame centroid movement.
+     * Used as a fallback when the hand landmarker model is unavailable (null landmarks),
+     * which can occur in both CALIBRATED_BENCHMARK mode and in MODEL_ACTIVE mode if the
+     * hand model fails to load while the object detector loads successfully.
+     *
+     * Presence alone is insufficient — a static wire resting on the board would also
+     * have pixel mass. Movement confirms active manipulation.
+     */
+    private fun inferHoldFromMovement(
+        wireSegments: List<WireSegmentFeature>,
+        relationships: MutableList<SpatialRelationship>,
+    ) {
+        for (wire in wireSegments) {
+            if (wire.detectedObject.label == "red_wire") {
+                val prevX = prevRedTipX
+                val prevY = prevRedTipY
+                val moved = prevX != null && prevY != null &&
+                        distance(wire.tipX, wire.tipY, prevX, prevY) > MOVEMENT_THRESHOLD
+
+                if (moved) {
+                    // FALLBACK: inferred from centroid motion, not direct landmark observation
+                    relationships.add(
+                        SpatialRelationship(
+                            subject    = "hand",
+                            relation   = "holding",
+                            target     = "red_wire",
+                            confidence = 0.65f,
+                        )
+                    )
+                    Timber.v("VisionEngine: Wire-hold inferred from movement delta")
+                }
+                prevRedTipX = wire.tipX
+                prevRedTipY = wire.tipY
+                break
+            }
+        }
+    }
+
     fun release() {
         objectDetector?.close()
         handLandmarker?.close()
         objectDetector  = null
         handLandmarker  = null
         isInitialized   = false
+        // Reset movement-delta state — VisionEngine is a Singleton; without this,
+        // prevRedTipX/Y would persist into the next session and cause a false
+        // "moved" trigger on the very first frame.
+        prevRedTipX     = null
+        prevRedTipY     = null
         Timber.d("VisionEngine: Released")
     }
 

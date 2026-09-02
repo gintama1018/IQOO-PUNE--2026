@@ -106,11 +106,15 @@ data class ScoringWeights(
  */
 data class FrameObservation(
     val detectedObjects: List<DetectedObject>,
-    val relationships: List<SpatialRelationship>,
-    val handLandmarks: List<HandLandmark>?,
-    val frameTimestamp: Long,
-    val confidence: Float,
-    val frameQuality: FrameQuality,
+    val relationships:   List<SpatialRelationship>,
+    val handLandmarks:   List<HandLandmark>?,
+    val frameTimestamp:  Long,
+    val confidence:      Float,
+    val frameQuality:    FrameQuality,
+    /** COCO EfficientDet output — quarantined from the Validator pipeline.
+     *  Labels are 90-class COCO (person, cup, etc.) with no overlap to
+     *  the task label vocabulary. Kept here for optional debug/display use only. */
+    val auxDetections:   List<DetectedObject> = emptyList(),
 )
 
 data class DetectedObject(
