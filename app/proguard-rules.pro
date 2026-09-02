@@ -17,3 +17,9 @@
 
 # Keep Hilt
 -keep class dagger.hilt.** { *; }
+
+# Suppress annotation processor / shaded reflection warnings
+-dontwarn javax.lang.model.**
+-dontwarn autovalue.shaded.**
+-dontwarn com.google.auto.value.**
+

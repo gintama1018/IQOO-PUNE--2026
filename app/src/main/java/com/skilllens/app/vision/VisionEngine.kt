@@ -3,16 +3,10 @@ package com.skilllens.app.vision
 import android.content.Context
 import android.graphics.Bitmap
 import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.framework.image.MPImage
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.skilllens.app.taskengine.BoundingBox
 import com.skilllens.app.taskengine.DetectedObject
 import com.skilllens.app.taskengine.FrameObservation
 import com.skilllens.app.taskengine.FrameQuality
-import com.skilllens.app.taskengine.HandLandmark
 import com.skilllens.app.taskengine.SpatialRelationship
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,24 +15,18 @@ import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.math.abs
 import kotlin.math.sqrt
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VisionEngine — On-Device Hybrid ML & Physical Task Perception Engine
+// VisionEngine — On-Device Computer Vision & Physical Task Perception Engine
 //
-// Dual-Pipeline Architecture:
-//   1. On-Device MediaPipe Models (assets/models/):
-//      - hand_landmarker.task  : 21-point 3D hand tracking & pinch grasp geometry
-//      - efficientdet_lite0.tflite : Auxiliary scene context only (90-class COCO;
-//        output quarantined to auxDetections — not used in task validation)
-//   2. Scene-Adaptive Physical Verification:
-//      - Luminance-mass board ROI detection (fails on uniform surfaces like blank
-//        walls; terminal zones are proportional anchors, not full localization)
-//      - Chromatic wire segmentation (Red = Live, Black = Neutral, Earth = Green/Yellow)
-//      - Terminal entry aperture insertion vs. nearness geometry ("near != connected")
-//      - Real-time occlusion detection (hands obscuring terminal inspection zone)
-//      - Wrong connection classification (e.g. wire inserted into L1 / L2)
+// Modular Architecture:
+//   1. PersonDetector: Trainee presence, isolation, and user count.
+//   2. BoardLocalizer: Image-evidence boundary scan & normalized board coordinate space.
+//   3. HandLandmarkAnalyzer: MediaPipe 21 3D landmarks, pinch grasp detection & occlusion.
+//   4. WirePerceptor: HSV chromatic segmentation + aspect ratio shape filtering.
+//   5. ObjectTracker: Multi-frame temporal tracking & velocity estimation.
+//   6. InteractionAnalyzer: Aperture containment vs. nearness geometry & connection stability.
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum class VisionMode {
@@ -49,147 +37,91 @@ enum class VisionMode {
 @Singleton
 class VisionEngine @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val personDetector: PersonDetector,
+    private val boardLocalizer: BoardLocalizer,
+    private val handLandmarkAnalyzer: HandLandmarkAnalyzer,
+    private val wirePerceptor: WirePerceptor,
+    private val objectTracker: ObjectTracker,
+    private val interactionAnalyzer: InteractionAnalyzer,
 ) {
-
-    private var objectDetector: ObjectDetector? = null
-    private var handLandmarker: HandLandmarker? = null
 
     private val _visionMode = MutableStateFlow(VisionMode.CALIBRATED_BENCHMARK)
     val visionMode: StateFlow<VisionMode> = _visionMode.asStateFlow()
 
     private var isInitialized = false
 
-    // Movement-delta fallback state — tracks red wire tip across frames.
-    // Used to infer "holding" when hand landmarker is unavailable (partial failure).
+    // Movement-delta fallback state for wire tip motion tracking
     private var prevRedTipX: Float? = null
     private var prevRedTipY: Float? = null
 
-    private val OBJECT_DETECTOR_MODEL = "models/efficientdet_lite0.tflite"
-    private val HAND_LANDMARKER_MODEL = "models/hand_landmarker.task"
-
     companion object {
-        /** Minimum normalized centroid movement to infer a wire is being held. */
         private const val MOVEMENT_THRESHOLD = 0.04f
     }
 
     fun initialize() {
         if (isInitialized) return
-        var detectorLoaded = false
-        var handLoaded = false
 
-        try {
-            initObjectDetector()
-            detectorLoaded = true
-            Timber.i("VisionEngine: On-device ObjectDetector ($OBJECT_DETECTOR_MODEL) active.")
-        } catch (e: Exception) {
-            Timber.w("VisionEngine: Object detector load warning: ${e.message}")
-        }
+        val handLoaded = handLandmarkAnalyzer.initialize()
+        _visionMode.value = if (handLoaded) VisionMode.MODEL_ACTIVE else VisionMode.CALIBRATED_BENCHMARK
 
-        try {
-            initHandLandmarker()
-            handLoaded = true
-            Timber.i("VisionEngine: On-device HandLandmarker ($HAND_LANDMARKER_MODEL) active.")
-        } catch (e: Exception) {
-            Timber.w("VisionEngine: Hand landmarker load warning: ${e.message}")
-        }
-
-        _visionMode.value = if (detectorLoaded || handLoaded) VisionMode.MODEL_ACTIVE else VisionMode.CALIBRATED_BENCHMARK
         isInitialized = true
-        Timber.i("VisionEngine: Initialized successfully in mode ${_visionMode.value}")
-    }
-
-    private fun initObjectDetector() {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(OBJECT_DETECTOR_MODEL)
-            .build()
-
-        val options = ObjectDetector.ObjectDetectorOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setRunningMode(RunningMode.IMAGE)
-            .setMaxResults(8)
-            .setScoreThreshold(0.30f)
-            .build()
-
-        objectDetector = ObjectDetector.createFromOptions(context, options)
-    }
-
-    private fun initHandLandmarker() {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath(HAND_LANDMARKER_MODEL)
-            .build()
-
-        val options = HandLandmarker.HandLandmarkerOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setRunningMode(RunningMode.IMAGE)
-            .setNumHands(2)
-            .setMinHandDetectionConfidence(0.40f)
-            .setMinHandPresenceConfidence(0.40f)
-            .setMinTrackingConfidence(0.40f)
-            .build()
-
-        handLandmarker = HandLandmarker.createFromOptions(context, options)
+        Timber.i("VisionEngine: Initialized in mode ${_visionMode.value}")
     }
 
     fun analyze(bitmap: Bitmap, quality: FrameQuality): FrameObservation {
+        val timestamp = System.currentTimeMillis()
+
         if (quality == FrameQuality.LOW_LIGHT || quality == FrameQuality.BLURRY) {
             return FrameObservation(
                 detectedObjects = emptyList(),
                 relationships   = emptyList(),
                 handLandmarks   = null,
-                frameTimestamp  = System.currentTimeMillis(),
+                frameTimestamp  = timestamp,
                 confidence      = 0f,
                 frameQuality    = quality,
+                boardROI        = null,
             )
         }
 
-        return if (objectDetector != null || handLandmarker != null) {
-            analyzeWithModels(bitmap, quality)
-        } else {
-            analyzeWithCalibratedBenchmark(bitmap, quality)
-        }
-    }
-
-    private fun analyzeWithModels(bitmap: Bitmap, quality: FrameQuality): FrameObservation {
-        val mpImage = BitmapImageBuilder(bitmap).build()
-        val timestamp = System.currentTimeMillis()
-
-        // 1. Scene-Adaptive Board ROI — returns null when scene is too uniform (blank wall/ceiling)
-        val boardBox = detectBoardROI(bitmap) ?: run {
-            Timber.d("VisionEngine: Board ROI not detected — uniform scene")
+        // 1. Evidence-Based Board Localization & Coordinate System
+        val boardResult = boardLocalizer.localizeBoard(bitmap)
+        if (boardResult == null) {
+            Timber.d("VisionEngine: Board ROI not detected — uniform scene (wall/table/ceiling)")
+            val personObs = personDetector.detectPerson(bitmap, hasActiveHands = false)
             return FrameObservation(
-                detectedObjects = emptyList(),
-                relationships   = emptyList(),
-                handLandmarks   = null,
-                frameTimestamp  = timestamp,
-                confidence      = 0.2f,  // Low confidence — nothing meaningful detected
-                frameQuality    = quality,
+                detectedObjects    = emptyList(),
+                relationships      = emptyList(),
+                handLandmarks      = null,
+                frameTimestamp     = timestamp,
+                confidence         = 0.2f, // Low confidence -> TASK_OUT_OF_FRAME
+                frameQuality       = FrameQuality.FRAMING_BAD,
+                personObservation  = personObs,
+                boardROI           = null,
             )
         }
 
+        val (boardBox, transformer) = boardResult
         val detectedObjects = mutableListOf<DetectedObject>()
-        val auxDetections   = mutableListOf<DetectedObject>()
 
+        // 2. Dynamic Board and Proportional Terminal Anchors
+        val boardConfidence = (boardBox.width * boardBox.height * 4f).coerceIn(0.65f, 0.96f)
         detectedObjects.add(
             DetectedObject(
                 label       = "board",
-                confidence  = boardBox.width * boardBox.height * 4f,  // confidence derived from detected ROI area
+                confidence  = boardConfidence,
                 boundingBox = boardBox,
-            ).let { it.copy(confidence = it.confidence.coerceIn(0.60f, 0.96f)) }
+            )
         )
+
         detectedObjects.add(
             DetectedObject(
                 label       = "terminal_block",
                 confidence  = 0.88f,
-                boundingBox = BoundingBox(
-                    boardBox.left + boardBox.width * 0.08f,
-                    boardBox.top + boardBox.height * 0.35f,
-                    boardBox.right - boardBox.width * 0.08f,
-                    boardBox.bottom - boardBox.height * 0.08f
-                ),
+                boundingBox = transformer.computeTerminalBlockBox(),
             )
         )
 
-        val dynamicAnchors = computeDynamicTerminalAnchors(boardBox)
+        val dynamicAnchors = transformer.computeDynamicTerminalAnchors()
         for (anchor in dynamicAnchors) {
             detectedObjects.add(
                 DetectedObject(
@@ -200,489 +132,104 @@ class VisionEngine @Inject constructor(
             )
         }
 
-        // 2. EfficientDet COCO Inference — output quarantined to auxDetections.
-        //    Labels are 90-class COCO (person, cup, etc.) — no overlap with task
-        //    label vocabulary. Not forwarded to detectedObjects or Validator.
-        try {
-            objectDetector?.detect(mpImage)?.detections()?.forEach { detection ->
-                val box = detection.boundingBox()
-                val category = detection.categories().firstOrNull()
-                val label = category?.categoryName()?.lowercase() ?: "object"
-                auxDetections.add(
-                    DetectedObject(
-                        label       = label,
-                        confidence  = category?.score() ?: 0.5f,
-                        boundingBox = BoundingBox(
-                            left   = (box.left / bitmap.width.toFloat()).coerceIn(0f, 1f),
-                            top    = (box.top / bitmap.height.toFloat()).coerceIn(0f, 1f),
-                            right  = (box.right / bitmap.width.toFloat()).coerceIn(0f, 1f),
-                            bottom = (box.bottom / bitmap.height.toFloat()).coerceIn(0f, 1f),
-                        ),
-                    )
-                )
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "VisionEngine: Object detector inference error")
-        }
-
-        // 3. Chromatic Wire Detection & Endpoint Segmentation
-        val wireSegments = extractCalibratedWireSegments(bitmap)
+        // 3. Multi-Signal Chromatic & Shape-Filtered Wire Extraction
+        val wireSegments = wirePerceptor.extractWireSegments(bitmap, transformer)
         for (wire in wireSegments) {
             detectedObjects.add(wire.detectedObject)
         }
 
-        // 4. MediaPipe Hand Landmark Tracking & Hand Object Bounding Box
-        val handLandmarks = extractSemanticHandLandmarks(mpImage)
-        var isOccluded = false
-        if (handLandmarks != null && handLandmarks.isNotEmpty()) {
-            val minX = handLandmarks.minOf { it.x }.coerceIn(0f, 1f)
-            val maxX = handLandmarks.maxOf { it.x }.coerceIn(0f, 1f)
-            val minY = handLandmarks.minOf { it.y }.coerceIn(0f, 1f)
-            val maxY = handLandmarks.maxOf { it.y }.coerceIn(0f, 1f)
-            val handBox = BoundingBox(minX, minY, maxX, maxY)
+        // 4. MediaPipe 21-Landmark Hand & Grasp Detection
+        val mpImage = BitmapImageBuilder(bitmap).build()
+        val handObservations = handLandmarkAnalyzer.analyzeHands(mpImage, dynamicAnchors)
 
+        var isOccluded = false
+        val allHandLandmarks = mutableListOf<com.skilllens.app.taskengine.HandLandmark>()
+
+        for (hand in handObservations) {
             detectedObjects.add(
                 DetectedObject(
                     label       = "hand",
                     confidence  = 0.95f,
-                    boundingBox = handBox,
+                    boundingBox = hand.handBox,
                 )
             )
-
-            val coveredTerminals = dynamicAnchors.count { anchor ->
-                anchor.box.centerX in handBox.left..handBox.right &&
-                        anchor.box.centerY in handBox.top..handBox.bottom
+            allHandLandmarks.addAll(hand.landmarks)
+            if (hand.isOccludingTerminals) {
+                isOccluded = true
             }
-            if (coveredTerminals >= 3) isOccluded = true
         }
 
-        // 5. Evaluate Spatial Relationships & Physical Contacts
-        val relationships = mutableListOf<SpatialRelationship>()
-        relationships.addAll(evaluateConnectionAndGripGeometry(wireSegments, dynamicAnchors, handLandmarks))
+        // 5. Person Presence & Participant Isolation Check
+        val personObs = personDetector.detectPerson(bitmap, hasActiveHands = handObservations.isNotEmpty())
+        if (personObs.personCount > 0 && personObs.primaryPersonBox != null) {
+            detectedObjects.add(
+                DetectedObject(
+                    label       = "person",
+                    confidence  = 0.90f,
+                    boundingBox = personObs.primaryPersonBox,
+                )
+            )
+        }
 
-        // 6. FALLBACK: Movement-delta wire-hold inference.
-        //    Activated when hand landmarker is unavailable (partial model-load failure).
-        //    handLandmarks == null even in MODEL_ACTIVE mode if hand model failed to load.
-        //    Presence alone is not sufficient — we require centroid movement to distinguish
-        //    a wire being actively held from one resting on the board.
-        if (handLandmarks == null) {
+        // 6. Kinematic Object & Motion Tracking
+        val trackedEntities = objectTracker.trackObjects(
+            detectedObjects  = detectedObjects,
+            handObservations = handObservations,
+            terminalAnchors  = dynamicAnchors,
+            timestamp        = timestamp,
+        )
+
+        // 7. Physical Interaction & Connection Reasoning (Aperture Entry + Grasping)
+        val relationships = mutableListOf<SpatialRelationship>()
+        relationships.addAll(
+            interactionAnalyzer.evaluateInteractions(
+                wireObservations = wireSegments,
+                terminalAnchors  = dynamicAnchors,
+                handObservations = handObservations,
+                transformer      = transformer,
+            )
+        )
+
+        // 8. Fallback wire motion inference when hand landmarks are unavailable
+        if (handObservations.isEmpty()) {
             inferHoldFromMovement(wireSegments, relationships)
         }
 
-        val effectiveQuality = if (isOccluded) FrameQuality.OCCLUDED else quality
+        val effectiveQuality = when {
+            isOccluded -> FrameQuality.OCCLUDED
+            !personObs.isParticipantIsolated -> FrameQuality.FRAMING_BAD
+            else -> quality
+        }
+
         val avgConfidence = if (detectedObjects.isEmpty()) 0.2f
         else detectedObjects.map { it.confidence }.average().toFloat()
 
         return FrameObservation(
-            detectedObjects = detectedObjects,
-            relationships   = relationships,
-            handLandmarks   = handLandmarks,
-            frameTimestamp  = timestamp,
-            confidence      = if (isOccluded) 0.35f else avgConfidence,
-            frameQuality    = effectiveQuality,
-            auxDetections   = auxDetections,
+            detectedObjects   = detectedObjects,
+            relationships     = relationships,
+            handLandmarks     = if (allHandLandmarks.isNotEmpty()) allHandLandmarks else null,
+            frameTimestamp    = timestamp,
+            confidence        = if (isOccluded) 0.35f else avgConfidence,
+            frameQuality      = effectiveQuality,
+            personObservation = personObs,
+            trackedEntities   = trackedEntities,
+            boardROI          = boardBox,
         )
     }
 
-    private fun analyzeWithCalibratedBenchmark(bitmap: Bitmap, quality: FrameQuality): FrameObservation {
-        val timestamp = System.currentTimeMillis()
-
-        // Scene-Adaptive Board ROI — null means scene is too uniform (blank wall/ceiling/sky)
-        val boardBox = detectBoardROI(bitmap) ?: run {
-            Timber.d("VisionEngine: Board ROI not detected (benchmark) — uniform scene")
-            return FrameObservation(
-                detectedObjects = emptyList(),
-                relationships   = emptyList(),
-                handLandmarks   = null,
-                frameTimestamp  = timestamp,
-                confidence      = 0.2f,
-                frameQuality    = quality,
-            )
-        }
-
-        val detected      = mutableListOf<DetectedObject>()
-        val relationships = mutableListOf<SpatialRelationship>()
-
-        detected.add(
-            DetectedObject(
-                label       = "board",
-                confidence  = (boardBox.width * boardBox.height * 4f).coerceIn(0.60f, 0.93f),
-                boundingBox = boardBox,
-            )
-        )
-        detected.add(
-            DetectedObject(
-                label       = "terminal_block",
-                confidence  = 0.88f,
-                boundingBox = BoundingBox(
-                    boardBox.left + boardBox.width * 0.08f,
-                    boardBox.top + boardBox.height * 0.35f,
-                    boardBox.right - boardBox.width * 0.08f,
-                    boardBox.bottom - boardBox.height * 0.08f
-                ),
-            )
-        )
-
-        val dynamicAnchors = computeDynamicTerminalAnchors(boardBox)
-        for (anchor in dynamicAnchors) {
-            detected.add(
-                DetectedObject(
-                    label       = anchor.id,
-                    confidence  = 0.85f,
-                    boundingBox = anchor.box,
-                )
-            )
-        }
-
-        val wireSegments = extractCalibratedWireSegments(bitmap)
-        for (wire in wireSegments) {
-            detected.add(wire.detectedObject)
-        }
-
-        relationships.addAll(evaluateConnectionAndGripGeometry(wireSegments, dynamicAnchors, null))
-
-        // FALLBACK: Movement-delta wire-hold inference (hand model not loaded in benchmark mode).
-        inferHoldFromMovement(wireSegments, relationships)
-
-        val avgConfidence = if (detected.isEmpty()) 0.2f
-        else detected.map { it.confidence }.average().toFloat()
-
-        return FrameObservation(
-            detectedObjects = detected,
-            relationships   = relationships,
-            handLandmarks   = null,
-            frameTimestamp  = timestamp,
-            confidence      = avgConfidence,
-            frameQuality    = quality,
-        )
-    }
-
-    /**
-     * Calibrated board-relative geometry with camera framing verification.
-     * Evaluates central region visual presence and framing alignment.
-     */
-    /**
-     * Scene-adaptive board ROI detection using luminance-mass analysis.
-     *
-     * Scans a 64×64 downsample for non-uniform pixels (the training board has
-     * visible texture — terminal labels, screws, coloured terminal blocks).
-     * Uniform scenes (blank walls, ceilings, sky) fall below the minimum pixel
-     * mass and return null, preventing false board/terminal detections.
-     *
-     * @return Detected ROI as a normalized BoundingBox, or null if the scene is
-     *         too uniform to contain a plausible board surface.
-     */
-    private fun detectBoardROI(bitmap: Bitmap): BoundingBox? {
-        val W = 64; val H = 64
-        val scaled = Bitmap.createScaledBitmap(bitmap, W, H, false)
-
-        // Compute per-pixel luminance and track the mean for variance calculation
-        val luma = Array(H) { y -> FloatArray(W) { x ->
-            val px = scaled.getPixel(x, y)
-            val r  = (px shr 16 and 0xFF) / 255f
-            val g  = (px shr 8  and 0xFF) / 255f
-            val b  = (px        and 0xFF) / 255f
-            0.299f * r + 0.587f * g + 0.114f * b
-        }}
-        scaled.recycle()
-
-        // Global mean luminance
-        val meanLuma = luma.flatMap { it.toList() }.average().toFloat()
-
-        // Count "interesting" pixels: deviate from mean by more than the threshold.
-        // This distinguishes textured board surfaces from uniform walls/ceilings.
-        val varianceThreshold = 0.08f
-        val minInterestingPixels = W * H / 6   // at least ~17% of pixels must be non-uniform
-
-        var minX = W; var maxX = 0
-        var minY = H; var maxY = 0
-        var interestingCount = 0
-
-        for (y in 0 until H) {
-            for (x in 0 until W) {
-                if (abs(luma[y][x] - meanLuma) > varianceThreshold) {
-                    interestingCount++
-                    if (x < minX) minX = x; if (x > maxX) maxX = x
-                    if (y < minY) minY = y; if (y > maxY) maxY = y
-                }
-            }
-        }
-
-        if (interestingCount < minInterestingPixels || maxX <= minX || maxY <= minY) {
-            // Scene is too uniform — no board detected
-            return null
-        }
-
-        // Expand detected region with a small margin and clamp to frame
-        val margin = 0.04f
-        return BoundingBox(
-            left   = (minX.toFloat() / W - margin).coerceIn(0f, 1f),
-            top    = (minY.toFloat() / H - margin).coerceIn(0f, 1f),
-            right  = (maxX.toFloat() / W + margin).coerceIn(0f, 1f),
-            bottom = (maxY.toFloat() / H + margin).coerceIn(0f, 1f),
-        )
-    }
-
-    private fun computeDynamicTerminalAnchors(boardBox: BoundingBox): List<TerminalAnchor> {
-        val bW = boardBox.width
-        val bH = boardBox.height
-        val bL = boardBox.left
-        val bT = boardBox.top
-
-        return listOf(
-            TerminalAnchor("L_terminal", BoundingBox(bL + bW * 0.12f, bT + bH * 0.38f, bL + bW * 0.28f, bT + bH * 0.62f), "Live (L)"),
-            TerminalAnchor("N_terminal", BoundingBox(bL + bW * 0.40f, bT + bH * 0.38f, bL + bW * 0.56f, bT + bH * 0.62f), "Neutral (N)"),
-            TerminalAnchor("E_terminal", BoundingBox(bL + bW * 0.68f, bT + bH * 0.38f, bL + bW * 0.84f, bT + bH * 0.62f), "Earth (E)"),
-            TerminalAnchor("L1_terminal", BoundingBox(bL + bW * 0.12f, bT + bH * 0.68f, bL + bW * 0.28f, bT + bH * 0.90f), "Auxiliary (L1)"),
-            TerminalAnchor("L2_terminal", BoundingBox(bL + bW * 0.40f, bT + bH * 0.68f, bL + bW * 0.56f, bT + bH * 0.90f), "Auxiliary (L2)"),
-        )
-    }
-
-    private fun extractSemanticHandLandmarks(mpImage: MPImage): List<HandLandmark>? {
-        return try {
-            val result = handLandmarker?.detect(mpImage)
-            result?.landmarks()?.flatMap { handList ->
-                handList.mapIndexed { index, lm ->
-                    HandLandmark(
-                        x            = lm.x(),
-                        y            = lm.y(),
-                        z            = lm.z(),
-                        landmarkType = index, // MediaPipe 0-20 semantic landmark index
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /**
-     * WireSegmentFeature contains the bounding box, wire pixel mass, and primary tip coordinates.
-     */
-    private data class WireSegmentFeature(
-        val detectedObject: DetectedObject,
-        val tipX: Float,
-        val tipY: Float,
-        val pixelCount: Int,
-    )
-
-    private fun extractCalibratedWireSegments(bitmap: Bitmap): List<WireSegmentFeature> {
-        val results = mutableListOf<WireSegmentFeature>()
-        val scaled = Bitmap.createScaledBitmap(bitmap, 128, 128, false)
-
-        var redPixels = 0; var blackPixels = 0; var greenPixels = 0
-        var minRedX = 128; var maxRedX = 0; var minRedY = 128; var maxRedY = 0
-        var minBlackX = 128; var maxBlackX = 0; var minBlackY = 128; var maxBlackY = 0
-        var minGreenX = 128; var maxGreenX = 0; var minGreenY = 128; var maxGreenY = 0
-
-        // Track closest tips (top-most / bottom-most insertion point)
-        var redTipX = 64f; var redTipY = 64f
-        var blackTipX = 64f; var blackTipY = 64f
-        var greenTipX = 64f; var greenTipY = 64f
-
-        for (y in 0 until scaled.height) {
-            for (x in 0 until scaled.width) {
-                val pixel = scaled.getPixel(x, y)
-                val r = (pixel shr 16) and 0xFF
-                val g = (pixel shr 8) and 0xFF
-                val b = pixel and 0xFF
-
-                if (r > 135 && g < 90 && b < 90) {
-                    redPixels++
-                    if (x < minRedX) minRedX = x; if (x > maxRedX) maxRedX = x
-                    if (y < minRedY) { minRedY = y; redTipX = x / 128f; redTipY = y / 128f }
-                    if (y > maxRedY) maxRedY = y
-                } else if (r < 60 && g < 60 && b < 60) {
-                    blackPixels++
-                    if (x < minBlackX) minBlackX = x; if (x > maxBlackX) maxBlackX = x
-                    if (y < minBlackY) { minBlackY = y; blackTipX = x / 128f; blackTipY = y / 128f }
-                    if (y > maxBlackY) maxBlackY = y
-                } else if (g > 90 && r < 95 && abs(r - b) < 50) {
-                    greenPixels++
-                    if (x < minGreenX) minGreenX = x; if (x > maxGreenX) maxGreenX = x
-                    if (y < minGreenY) { minGreenY = y; greenTipX = x / 128f; greenTipY = y / 128f }
-                    if (y > maxGreenY) maxGreenY = y
-                }
-            }
-        }
-        scaled.recycle()
-
-        val minPixelThreshold = 30
-
-        if (redPixels > minPixelThreshold && maxRedX > minRedX) {
-            results.add(
-                WireSegmentFeature(
-                    detectedObject = DetectedObject(
-                        label       = "red_wire",
-                        confidence  = 0.90f,
-                        boundingBox = BoundingBox(
-                            minRedX / 128f, minRedY / 128f,
-                            maxRedX / 128f, maxRedY / 128f
-                        ),
-                    ),
-                    tipX = redTipX,
-                    tipY = redTipY,
-                    pixelCount = redPixels,
-                )
-            )
-        }
-
-        if (blackPixels > minPixelThreshold && maxBlackX > minBlackX) {
-            results.add(
-                WireSegmentFeature(
-                    detectedObject = DetectedObject(
-                        label       = "black_wire",
-                        confidence  = 0.88f,
-                        boundingBox = BoundingBox(
-                            minBlackX / 128f, minBlackY / 128f,
-                            maxBlackX / 128f, maxBlackY / 128f
-                        ),
-                    ),
-                    tipX = blackTipX,
-                    tipY = blackTipY,
-                    pixelCount = blackPixels,
-                )
-            )
-        }
-
-        if (greenPixels > minPixelThreshold && maxGreenX > minGreenX) {
-            results.add(
-                WireSegmentFeature(
-                    detectedObject = DetectedObject(
-                        label       = "earth_wire",
-                        confidence  = 0.89f,
-                        boundingBox = BoundingBox(
-                            minGreenX / 128f, minGreenY / 128f,
-                            maxGreenX / 128f, maxGreenY / 128f
-                        ),
-                    ),
-                    tipX = greenTipX,
-                    tipY = greenTipY,
-                    pixelCount = greenPixels,
-                )
-            )
-        }
-
-        return results
-    }
-
-    /**
-     * Physical Terminal Entry & Connection vs Nearness Evaluation:
-     * - "connected_to": Wire insertion tip is seated inside the terminal core aperture slot + deep overlap.
-     * - "near": Wire is within proximity or hovering at the border without true aperture insertion.
-     * - Occlusion detection: Checks if hands cover the active terminal block.
-     */
-    private fun evaluateConnectionAndGripGeometry(
-        wireSegments: List<WireSegmentFeature>,
-        terminals: List<TerminalAnchor>,
-        hands: List<HandLandmark>?,
-    ): List<SpatialRelationship> {
-        val relationships = mutableListOf<SpatialRelationship>()
-
-        // 1. Wire-to-Terminal Connection vs Nearness Evaluation (Physical Aperture Insertion)
-        for (wire in wireSegments) {
-            val wireObj = wire.detectedObject
-            val wireBox = wireObj.boundingBox
-
-            for (term in terminals) {
-                val termBox = term.box
-
-                // Terminal core aperture insertion slot (inner 60% of terminal box)
-                val apertureLeft   = termBox.left + termBox.width * 0.15f
-                val apertureRight  = termBox.right - termBox.width * 0.15f
-                val apertureTop    = termBox.top + termBox.height * 0.15f
-                val apertureBottom = termBox.bottom - termBox.height * 0.15f
-
-                val isTipInAperture = wire.tipX in apertureLeft..apertureRight &&
-                        wire.tipY in apertureTop..apertureBottom
-
-                val centerDist = distance(wireBox.centerX, wireBox.centerY, termBox.centerX, termBox.centerY)
-                val tipDist = distance(wire.tipX, wire.tipY, termBox.centerX, termBox.centerY)
-
-                val hasIntersection = (wireBox.left < termBox.right && wireBox.right > termBox.left &&
-                        wireBox.top < termBox.bottom && wireBox.bottom > termBox.top)
-
-                if (isTipInAperture || (hasIntersection && tipDist < 0.06f)) {
-                    // True physical insertion into terminal entry slot
-                    relationships.add(
-                        SpatialRelationship(
-                            subject    = wireObj.label,
-                            relation   = "connected_to",
-                            target     = term.id,
-                            confidence = 0.94f,
-                        )
-                    )
-                } else if (hasIntersection || centerDist < 0.18f || tipDist < 0.14f) {
-                    // Hovering / near terminal but not yet inserted into slot
-                    relationships.add(
-                        SpatialRelationship(
-                            subject    = wireObj.label,
-                            relation   = "near",
-                            target     = term.id,
-                            confidence = 0.78f,
-                        )
-                    )
-                }
-            }
-        }
-
-        // 2. Hand-to-Wire Grasp Evaluation (Pinch between Thumb-Tip 4 & Index-Tip 8)
-        if (hands != null && hands.size >= 21) {
-            val thumbTip = hands.firstOrNull { it.landmarkType == 4 }
-            val indexTip = hands.firstOrNull { it.landmarkType == 8 }
-
-            if (thumbTip != null && indexTip != null) {
-                val pinchDist = distance(thumbTip.x, thumbTip.y, indexTip.x, indexTip.y)
-                val pinchCenter = Pair((thumbTip.x + indexTip.x) / 2f, (thumbTip.y + indexTip.y) / 2f)
-                val isPinching = pinchDist < 0.10f
-
-                for (wire in wireSegments) {
-                    val wireObj = wire.detectedObject
-                    val distToPinch = distance(pinchCenter.first, pinchCenter.second, wireObj.boundingBox.centerX, wireObj.boundingBox.centerY)
-                    if (distToPinch < 0.18f || (isPinching && distToPinch < 0.25f)) {
-                        relationships.add(
-                            SpatialRelationship(
-                                subject    = "hand",
-                                relation   = "holding",
-                                target     = wireObj.label,
-                                confidence = 0.90f,
-                            )
-                        )
-                    }
-                }
-            }
-        }
-
-        return relationships
-    }
-
-    private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float {
-        val dx = x1 - x2; val dy = y1 - y2
-        return sqrt((dx * dx + dy * dy).toDouble()).toFloat()
-    }
-
-    /**
-     * Infers a "hand holding wire" relationship from frame-to-frame centroid movement.
-     * Used as a fallback when the hand landmarker model is unavailable (null landmarks),
-     * which can occur in both CALIBRATED_BENCHMARK mode and in MODEL_ACTIVE mode if the
-     * hand model fails to load while the object detector loads successfully.
-     *
-     * Presence alone is insufficient — a static wire resting on the board would also
-     * have pixel mass. Movement confirms active manipulation.
-     */
     private fun inferHoldFromMovement(
-        wireSegments: List<WireSegmentFeature>,
+        wireSegments: List<WireObservation>,
         relationships: MutableList<SpatialRelationship>,
     ) {
         for (wire in wireSegments) {
-            if (wire.detectedObject.label == "red_wire") {
+            if (wire.label == "red_wire") {
                 val prevX = prevRedTipX
                 val prevY = prevRedTipY
-                val moved = prevX != null && prevY != null &&
-                        distance(wire.tipX, wire.tipY, prevX, prevY) > MOVEMENT_THRESHOLD
+                val dx = wire.tipX - (prevX ?: wire.tipX)
+                val dy = wire.tipY - (prevY ?: wire.tipY)
+                val moved = prevX != null && prevY != null && sqrt((dx * dx + dy * dy).toDouble()) > MOVEMENT_THRESHOLD
 
                 if (moved) {
-                    // FALLBACK: inferred from centroid motion, not direct landmark observation
                     relationships.add(
                         SpatialRelationship(
                             subject    = "hand",
@@ -691,7 +238,6 @@ class VisionEngine @Inject constructor(
                             confidence = 0.65f,
                         )
                     )
-                    Timber.v("VisionEngine: Wire-hold inferred from movement delta")
                 }
                 prevRedTipX = wire.tipX
                 prevRedTipY = wire.tipY
@@ -701,18 +247,12 @@ class VisionEngine @Inject constructor(
     }
 
     fun release() {
-        objectDetector?.close()
-        handLandmarker?.close()
-        objectDetector  = null
-        handLandmarker  = null
-        isInitialized   = false
-        // Reset movement-delta state — VisionEngine is a Singleton; without this,
-        // prevRedTipX/Y would persist into the next session and cause a false
-        // "moved" trigger on the very first frame.
-        prevRedTipX     = null
-        prevRedTipY     = null
+        handLandmarkAnalyzer.release()
+        objectTracker.reset()
+        interactionAnalyzer.reset()
+        isInitialized = false
+        prevRedTipX = null
+        prevRedTipY = null
         Timber.d("VisionEngine: Released")
     }
-
-    private data class TerminalAnchor(val id: String, val box: BoundingBox, val name: String)
 }

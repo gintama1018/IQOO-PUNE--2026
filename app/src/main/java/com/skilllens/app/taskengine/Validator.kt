@@ -105,24 +105,24 @@ class Validator @Inject constructor() {
                 // ── WRONG CONNECTION ────────────────────────────────────────────
                 // Wire is physically connected to a terminal that this step doesn't require.
                 errorPattern.contains("wrong_connection") -> {
-                    val wrongTerminals = listOf("l1", "l2", "l3").filter { terminal ->
-                        relationships.any { rel ->
-                            rel.subject.lowercase().contains("wire") &&
-                                    rel.relation == "connected_to" &&
-                                    rel.target.lowercase().contains(terminal) &&
-                                    !step.requiredRelationships.any { req ->
-                                        req.lowercase().contains(terminal)
-                                    }
-                        }
+                    val allTerminals = listOf("l_terminal", "n_terminal", "e_terminal", "l1_terminal", "l2_terminal", "l3_terminal", "l1", "l2", "l3")
+                    val wrongConnections = relationships.filter { rel ->
+                        rel.subject.lowercase().contains("wire") &&
+                                rel.relation == "connected_to" &&
+                                allTerminals.any { t -> rel.target.lowercase().contains(t) } &&
+                                !step.requiredRelationships.any { req ->
+                                    req.lowercase() == "${rel.subject}_${rel.relation}_${rel.target}".lowercase() ||
+                                            (req.lowercase().contains(rel.subject.lowercase()) && req.lowercase().contains(rel.target.lowercase()))
+                                }
                     }
-                    if (wrongTerminals.isNotEmpty()) {
+                    if (wrongConnections.isNotEmpty()) {
+                        val observedTarget = wrongConnections.first().target.replace("_", " ").uppercase()
                         return ValidatorResult(
                             proposedState = TaskState.WRONG_CONNECTION,
                             feedback = FeedbackEvent(
                                 type    = FeedbackType.ERROR,
                                 title   = "⚠ Wrong Connection",
-                                message = "Wire is connected to ${wrongTerminals.joinToString()}. " +
-                                        "Check the expected terminal.",
+                                message = "Wire is connected to $observedTarget. Check the expected terminal.",
                                 hapticPattern = HapticPattern.ERROR,
                                 isCorrection  = true,
                             ),

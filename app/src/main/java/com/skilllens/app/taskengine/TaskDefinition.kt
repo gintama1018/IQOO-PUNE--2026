@@ -38,12 +38,49 @@ enum class TaskState {
     OUT_OF_ORDER,       // Steps performed in wrong sequence
     MISSING_COMPONENT,  // Required component not visible
 
-    // ── Perception states (not errors, but action required) ───────────────
-    LOW_CONFIDENCE,     // Model cannot make a confident determination
-    OCCLUDED,           // Task area blocked / hidden
-    POOR_FRAMING,       // Camera too far / too close / angled
-    UNKNOWN_STATE,      // Observed state cannot be mapped to any known state
+    // ── Perception & Environment states ───────────────────────────────────
+    LOW_CONFIDENCE,             // Model cannot make a confident determination
+    OCCLUDED,                   // Task area blocked / hidden by hands or tools
+    POOR_FRAMING,               // Camera too far / too close / angled
+    TASK_OUT_OF_FRAME,          // Board or task area not found in view
+    NO_USER_DETECTED,           // No trainee detected in front of camera
+    MULTIPLE_USERS_DETECTED,    // Multiple people in frame; participant not isolated
+    UNKNOWN_STATE,              // Observed state cannot be mapped to any known state
 }
+
+/**
+ * Observed person presence and isolation state.
+ */
+data class PersonObservation(
+    val personCount: Int,
+    val primaryPersonBox: BoundingBox? = null,
+    val isParticipantIsolated: Boolean = true,
+)
+
+/**
+ * Kinematic motion state for tracked physical objects.
+ */
+enum class MotionState {
+    STATIONARY,
+    MOVING,
+    APPROACHING_TARGET,
+    ENTERING_APERTURE,
+    HELD_BY_HAND,
+    STABILIZING,
+}
+
+/**
+ * Tracked physical entity across temporal frames.
+ */
+data class TrackedEntity(
+    val trackingId: Int,
+    val label: String,
+    val boundingBox: BoundingBox,
+    val velocityX: Float = 0f,
+    val velocityY: Float = 0f,
+    val speed: Float = 0f,
+    val motionState: MotionState = MotionState.STATIONARY,
+)
 
 /**
  * Describes a single step in the task sequence.
@@ -105,16 +142,15 @@ data class ScoringWeights(
  * This is the contract between the ML layer and the task engine.
  */
 data class FrameObservation(
-    val detectedObjects: List<DetectedObject>,
-    val relationships:   List<SpatialRelationship>,
-    val handLandmarks:   List<HandLandmark>?,
-    val frameTimestamp:  Long,
-    val confidence:      Float,
-    val frameQuality:    FrameQuality,
-    /** COCO EfficientDet output — quarantined from the Validator pipeline.
-     *  Labels are 90-class COCO (person, cup, etc.) with no overlap to
-     *  the task label vocabulary. Kept here for optional debug/display use only. */
-    val auxDetections:   List<DetectedObject> = emptyList(),
+    val detectedObjects:    List<DetectedObject>,
+    val relationships:      List<SpatialRelationship>,
+    val handLandmarks:      List<HandLandmark>?,
+    val frameTimestamp:     Long,
+    val confidence:         Float,
+    val frameQuality:       FrameQuality,
+    val personObservation:  PersonObservation? = null,
+    val trackedEntities:    List<TrackedEntity> = emptyList(),
+    val boardROI:           BoundingBox? = null,
 )
 
 data class DetectedObject(
@@ -130,15 +166,15 @@ data class BoundingBox(
     val right: Float,
     val bottom: Float,
 ) {
-    val width  get() = right - left
-    val height get() = bottom - top
+    val width   get() = right - left
+    val height  get() = bottom - top
     val centerX get() = left + width / 2f
     val centerY get() = top + height / 2f
 }
 
 data class SpatialRelationship(
     val subject: String,
-    val relation: String,   // e.g. "connected_to", "near", "touching"
+    val relation: String,   // e.g. "connected_to", "near", "holding", "touching"
     val target: String,
     val confidence: Float,
 )

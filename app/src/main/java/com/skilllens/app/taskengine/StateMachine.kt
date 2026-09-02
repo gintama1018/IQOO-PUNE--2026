@@ -72,7 +72,41 @@ class StateMachine @Inject constructor(
             val skill        = skill ?: return
             val now          = System.currentTimeMillis()
 
-            // 1. Check frame quality
+            // 1. Check frame quality & environmental constraints
+            val personObs = observation.personObservation
+            when {
+                personObs != null && personObs.personCount == 0 && currentState != TaskState.COMPLETED -> {
+                    emitPerceptionFeedback(
+                        TaskState.NO_USER_DETECTED,
+                        currentState,
+                        skill,
+                        "No Trainee Visible",
+                        "Please step in front of the camera to begin practice."
+                    )
+                    return
+                }
+                personObs != null && !personObs.isParticipantIsolated && currentState != TaskState.COMPLETED -> {
+                    emitPerceptionFeedback(
+                        TaskState.MULTIPLE_USERS_DETECTED,
+                        currentState,
+                        skill,
+                        "Multiple People in Frame",
+                        "Only one active trainee should be visible for accurate evaluation."
+                    )
+                    return
+                }
+                observation.boardROI == null && currentState != TaskState.COMPLETED -> {
+                    emitPerceptionFeedback(
+                        TaskState.TASK_OUT_OF_FRAME,
+                        currentState,
+                        skill,
+                        "Board Out of View",
+                        "Point the camera at the training board to continue."
+                    )
+                    return
+                }
+            }
+
             val qualityState = resolveQualityState(observation.frameQuality)
             if (qualityState != null) {
                 emitQualityFeedback(qualityState, currentState, skill)
@@ -184,7 +218,7 @@ class StateMachine @Inject constructor(
                         newState      = result.proposedState,
                         stateChanged  = true,
                         feedback      = result.feedback,
-                        stepIndex     = currentStepIndex,
+                        stepIndex     = nextStepIndex,
                         totalSteps    = steps.size,
                         confidence    = observation.confidence,
                     )
@@ -206,12 +240,14 @@ class StateMachine @Inject constructor(
         }
     }
 
-    private fun resolveQualityState(quality: FrameQuality): TaskState? = when (quality) {
-        FrameQuality.GOOD        -> null
-        FrameQuality.LOW_LIGHT   -> TaskState.POOR_FRAMING
-        FrameQuality.BLURRY      -> TaskState.POOR_FRAMING
-        FrameQuality.OCCLUDED    -> TaskState.OCCLUDED
-        FrameQuality.FRAMING_BAD -> TaskState.POOR_FRAMING
+    private fun resolveQualityState(quality: FrameQuality): TaskState? {
+        return when (quality) {
+            FrameQuality.OCCLUDED    -> TaskState.OCCLUDED
+            FrameQuality.FRAMING_BAD -> TaskState.POOR_FRAMING
+            FrameQuality.LOW_LIGHT   -> TaskState.LOW_CONFIDENCE
+            FrameQuality.BLURRY      -> TaskState.LOW_CONFIDENCE
+            FrameQuality.GOOD        -> null
+        }
     }
 
     private fun emitQualityFeedback(
@@ -224,14 +260,24 @@ class StateMachine @Inject constructor(
             TaskState.OCCLUDED     -> "Something is blocking the view. Move hands aside."
             else                   -> "Adjust the camera position."
         }
-        _taskState.value = qualityState
+        emitPerceptionFeedback(qualityState, previousState, skill, "Adjust View", message)
+    }
+
+    private fun emitPerceptionFeedback(
+        state: TaskState,
+        previousState: TaskState,
+        skill: SkillDefinition,
+        title: String,
+        message: String,
+    ) {
+        _taskState.value = state
         _validationResult.value = ValidationResult(
             previousState = previousState,
-            newState      = qualityState,
-            stateChanged  = previousState != qualityState,
+            newState      = state,
+            stateChanged  = previousState != state,
             feedback = FeedbackEvent(
-                type    = FeedbackType.INFO,
-                title   = "Adjust View",
+                type    = FeedbackType.WARNING,
+                title   = title,
                 message = message,
                 hapticPattern = HapticPattern.NONE,
             ),
